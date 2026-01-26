@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Session {{ session_id[:8] }} - Voice Transcript</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+        .status {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: bold;
+            margin-bottom: 20px;
+        }
+        .status.pending { background: #fff3cd; color: #856404; }
+        .status.uploading { background: #d1ecf1; color: #0c5460; }
+        .status.processing { background: #d1ecf1; color: #0c5460; }
+        .status.done { background: #d4edda; color: #155724; }
+        .status.error { background: #f8d7da; color: #721c24; }
+        .status.cancelled { background: #ffeaa7; color: #856404; }
+        .section {
+            margin: 30px 0;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+        .section h2 {
+            margin-top: 0;
+            color: #555;
+        }
+        .transcript {
+            white-space: pre-wrap;
+            line-height: 1.6;
+            background: white;
+            padding: 15px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+        .timestamps {
+            background: white;
+            padding: 15px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .timestamp-item {
+            padding: 8px;
+            border-bottom: 1px solid #eee;
+        }
+        .timestamp-item:last-child {
+            border-bottom: none;
+        }
+        .summary ul {
+            list-style: none;
+            padding: 0;
+        }
+        .summary li {
+            padding: 8px 0;
+            border-bottom: 1px solid #ddd;
+        }
+        .summary li:last-child {
+            border-bottom: none;
+        }
+        .summary li:before {
+            content: "• ";
+            color: #007bff;
+            font-weight: bold;
+            margin-right: 8px;
+        }
+        .analytics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .metric {
+            background: white;
+            padding: 15px;
+            border-radius: 4px;
+            border: 1px solid #ddd;
+        }
+        .metric-label {
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+        }
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #333;
+            margin-top: 5px;
+        }
+        .downloads {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .download-btn {
+            display: inline-block;
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+        }
+        .download-btn:hover {
+            opacity: 0.9;
+        }
+        .speaker-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-weight: bold;
+            font-size: 14px;
+            color: white;
+            margin-bottom: 8px;
+        }
+        .speaker-0 { background: #007bff; }
+        .speaker-1 { background: #28a745; }
+        .speaker-2 { background: #dc3545; }
+        .speaker-3 { background: #ffc107; color: #000; }
+        .speaker-4 { background: #6f42c1; }
+        .speaker-5 { background: #fd7e14; }
+        .links {
+            margin-bottom: 20px;
+        }
+        .links a {
+            color: #007bff;
+            text-decoration: none;
+            margin-right: 20px;
+        }
+        .processing {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        .processing::after {
+            content: "...";
+            animation: dots 1.5s steps(4, end) infinite;
+        }
+        @keyframes dots {
+            0%, 20% { content: "."; }
+            40% { content: ".."; }
+            60%, 100% { content: "..."; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="links">
+            <a href="/{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}">← Upload New</a>
+            <a href="/sessions{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}">← All Sessions</a>
+        </div>
+        
+        <h1>Session: <code>{{ session_id }}</code></h1>
+        <span class="status {{ status }}">{{ status }}</span>
+        
+        {% if status == "cancelled" %}
+        <div class="section">
+            <p style="color: #856404;">This transcription was cancelled.</p>
+            <a href="/{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}" class="download-btn" style="display: inline-block; margin-top: 10px;">Upload New File</a>
+        </div>
+        {% elif status == "processing" or status == "uploaded" %}
+        <div class="section" id="progressSection">
+            <h2>📊 Progress</h2>
+            <div style="margin: 20px 0;">
+                <div style="margin-bottom: 15px;">
+                    <strong>Upload:</strong> 
+                    <span id="uploadProgress">100%</span>
+                    <div style="background: #e0e0e0; height: 25px; border-radius: 10px; margin-top: 5px; position: relative;">
+                        <div style="background: #4CAF50; height: 100%; width: 100%; border-radius: 10px; text-align: center; line-height: 25px; color: white; font-size: 14px; font-weight: bold;">100%</div>
+                    </div>
+                </div>
+                <div style="margin-bottom: 15px;">
+                    <strong>Processing:</strong> 
+                    <span id="processingProgress" style="font-weight: bold; font-size: 16px; color: #2196F3;">0%</span>
+                    <span id="stageText" style="color: #666; margin-left: 10px;">- starting</span>
+                    <div style="background: #e0e0e0; height: 25px; border-radius: 10px; margin-top: 5px; position: relative;">
+                        <div id="processingBar" style="background: #2196F3; height: 100%; width: 0%; border-radius: 10px; text-align: center; line-height: 25px; color: white; font-size: 14px; font-weight: bold; transition: width 0.3s;">0%</div>
+                    </div>
+                </div>
+                <div style="margin-top: 20px;">
+                    <button id="cancelBtn" onclick="cancelTranscription()" style="background: #dc3545; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px;">Cancel Transcription</button>
+                </div>
+            </div>
+        </div>
+        <script>
+            const sessionId = '{{ session_id }}';
+            const AUTH_TOKEN = "{{ auth_token or '' }}";
+            const AUTH_QUERY_PARAM = "{{ auth_query_param or 'token' }}";
+
+            function withToken(url) {
+                if (!AUTH_TOKEN) return url;
+                try {
+                    const u = new URL(url, window.location.origin);
+                    u.searchParams.set(AUTH_QUERY_PARAM, AUTH_TOKEN);
+                    return u.pathname + u.search;
+                } catch (e) {
+                    const separator = url.includes('?') ? '&' : '?';
+                    return url + separator + encodeURIComponent(AUTH_QUERY_PARAM) + '=' + encodeURIComponent(AUTH_TOKEN);
+                }
+            }
+            let pollInterval;
+            
+            function updateProgress() {
+                fetch(withToken(`/api/session/${sessionId}`))
+                    .then(r => r.json())
+                    .then(data => {
+                        const progress = data.progress || {upload: 0, processing: 0, stage: 'unknown'};
+                        
+                        // Always show percentages
+                        document.getElementById('uploadProgress').textContent = progress.upload + '%';
+                        document.getElementById('processingProgress').textContent = progress.processing + '%';
+                        document.getElementById('stageText').textContent = ' - ' + (progress.stage || 'processing');
+                        
+                        const processingBar = document.getElementById('processingBar');
+                        processingBar.style.width = progress.processing + '%';
+                        processingBar.textContent = progress.processing + '%';
+                        
+                        if (data.status === 'done') {
+                            clearInterval(pollInterval);
+                            location.reload();
+                        } else if (data.status === 'error') {
+                            clearInterval(pollInterval);
+                            document.getElementById('cancelBtn').style.display = 'none';
+                            alert('Transcription failed: ' + (data.error || 'Unknown error'));
+                        } else if (data.status === 'cancelled') {
+                            clearInterval(pollInterval);
+                            document.getElementById('cancelBtn').style.display = 'none';
+                            alert('Transcription cancelled');
+                            location.reload();
+                        }
+                    })
+                    .catch(err => console.error('Progress update error:', err));
+            }
+            
+            function cancelTranscription() {
+                if (confirm('Are you sure you want to cancel this transcription?')) {
+                    fetch(withToken(`/api/cancel/${sessionId}`), {method: 'POST'})
+                        .then(r => r.json())
+                        .then(data => {
+                            if (data.status === 'cancelled') {
+                                clearInterval(pollInterval);
+                                document.getElementById('cancelBtn').style.display = 'none';
+                                alert('Transcription cancelled');
+                                location.reload();
+                            } else {
+                                alert(data.message || 'Could not cancel transcription');
+                            }
+                        })
+                        .catch(err => {
+                            console.error('Cancel error:', err);
+                            alert('Error cancelling transcription');
+                        });
+                }
+            }
+            
+            // Poll every 2 seconds
+            pollInterval = setInterval(updateProgress, 2000);
+            updateProgress(); // Initial update
+        </script>
+        {% elif status == "done" %}
+        
+        <div class="section">
+            <h2>📥 Downloads</h2>
+            <div class="downloads">
+                <a href="/api/download/{{ session_id }}/audio.wav{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}" class="download-btn" style="background: #28a745;">Download Audio</a>
+                {% if transcript_by_speaker %}
+                <a href="/api/download/{{ session_id }}/transcript_by_speaker.txt{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}" class="download-btn" style="background: #007bff;">Download Transcript (TXT)</a>
+                <a href="/api/download/{{ session_id }}/transcript_by_speaker.json{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}" class="download-btn" style="background: #17a2b8;">Download Transcript (JSON)</a>
+                {% else %}
+                <a href="/api/download/{{ session_id }}/transcript.txt{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}" class="download-btn" style="background: #007bff;">Download Transcript (TXT)</a>
+                {% endif %}
+                <a href="/api/download/{{ session_id }}/subtitles.srt{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}" class="download-btn" style="background: #ffc107; color: #000;">Download Subtitles (SRT)</a>
+                <a href="/api/download/{{ session_id }}/subtitles.vtt{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}" class="download-btn" style="background: #fd7e14;">Download Subtitles (VTT)</a>
+            </div>
+        </div>
+        
+        {% if transcript_by_speaker and speaker_groups %}
+        <div class="section">
+            <h2>📝 Transcript by Speaker</h2>
+            {% for speaker, segments in speaker_groups.items() %}
+            <div style="margin-bottom: 20px;">
+                <span class="speaker-badge speaker-{{ loop.index0 }}">{{ speaker }}</span>
+                <div class="transcript" style="margin-top: 10px;">
+                    {% for seg in segments %}
+                    <div style="margin-bottom: 8px;">
+                        <span style="color: #666; font-size: 12px;">[{{ "%.2f"|format(seg.start) }}s - {{ "%.2f"|format(seg.end) }}s]</span>
+                        <span style="margin-left: 8px;">{{ seg.text }}</span>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% elif transcript %}
+        <div class="section">
+            <h2>📝 Transcript</h2>
+            <div class="transcript">{{ transcript }}</div>
+        </div>
+        {% endif %}
+        
+        {% if timestamps %}
+        <div class="section">
+            <h2>⏱️ Timestamps</h2>
+            <div class="timestamps">
+                {% for item in timestamps %}
+                <div class="timestamp-item">
+                    <strong>{{ "%.2f"|format(item.start) }}s - {{ "%.2f"|format(item.end) }}s:</strong>
+                    {{ item.text }}
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        
+        {% if summary and summary.bullets %}
+        <div class="section">
+            <h2>📋 Summary</h2>
+            <div class="summary">
+                <ul>
+                    {% for bullet in summary.bullets %}
+                    <li>{{ bullet }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+        </div>
+        {% endif %}
+        
+        {% if analytics %}
+        <div class="section">
+            <h2>📊 Analytics</h2>
+            <div class="analytics">
+                <div class="metric">
+                    <div class="metric-label">Duration</div>
+                    <div class="metric-value">{{ "%.1f"|format(analytics.duration) }}s</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Word Count</div>
+                    <div class="metric-value">{{ analytics.word_count }}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Words/Minute</div>
+                    <div class="metric-value">{{ "%.1f"|format(analytics.words_per_minute) }}</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-label">Long Pauses</div>
+                    <div class="metric-value">{{ analytics.long_pauses_count }}</div>
+                </div>
+            </div>
+            {% if analytics.signals %}
+            <div style="margin-top: 20px; padding: 15px; background: white; border-radius: 4px;">
+                <strong>Signals:</strong>
+                <ul style="margin: 10px 0;">
+                    {% for key, value in analytics.signals.items() %}
+                    {% if key != "disclaimer" %}
+                    <li><strong>{{ key.replace("_", " ").title() }}:</strong> {{ value }}</li>
+                    {% endif %}
+                    {% endfor %}
+                </ul>
+                {% if analytics.signals.disclaimer %}
+                <small style="color: #666;">{{ analytics.signals.disclaimer }}</small>
+                {% endif %}
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+        
+        {% elif status == "error" %}
+        <div class="section">
+            <p style="color: #721c24;">An error occurred during transcription. Please try uploading again.</p>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>

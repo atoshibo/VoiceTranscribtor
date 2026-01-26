@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <array name="languages">
+        <item>Russian (RU)</item>
+        <item>English (EN)</item>
+        <item>French (FR)</item>
+    </array>
+    <array name="speaker_counts">
+        <item>1</item>
+        <item>2</item>
+        <item>3</item>
+    </array>
+</resources>
+

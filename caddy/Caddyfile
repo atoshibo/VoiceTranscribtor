@@ -1,0 +1,8 @@
+# Caddy reverse proxy with HTTPS (TLS termination)
+# Simple reverse proxy to web service
+
+:8443 {
+    tls /certs/server.crt /certs/server.key
+    encode gzip
+    reverse_proxy web:8000
+}

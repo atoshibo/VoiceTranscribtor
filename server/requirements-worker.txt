@@ -1,0 +1,12 @@
+# Worker service requirements (includes GPU dependencies)
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+faster-whisper==0.10.0
+jinja2==3.1.2
+numpy<2.0
+pyannote.audio==3.1.1
+torch>=2.0.0
+torchaudio>=2.0.0
+ffmpeg-python==0.2.0
+redis==5.0.1

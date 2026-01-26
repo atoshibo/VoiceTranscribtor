@@ -1,0 +1,122 @@
+VOICE RECORD TRANSCRIPTOR - SYSTEM NOTES
+=========================================
+
+QUICK START
+-----------
+1. Set AUTH_TOKEN environment variable:
+   Windows: set AUTH_TOKEN=your_secret_token_here
+   Linux:   export AUTH_TOKEN=your_secret_token_here
+
+2. Start services:
+   docker compose up -d --build
+
+3. Check logs:
+   docker compose logs -f worker
+
+4. Access UI:
+   https://localhost:8443?token=your_secret_token_here
+
+GPU CONFIGURATION
+-----------------
+Force specific GPU via environment variables in docker-compose.yml:
+- FORCE_DEVICE=cuda or cpu (default: cuda)
+- CUDA_DEVICE_INDEX=0 (default: 0, use first GPU)
+- CUDA_VISIBLE_DEVICES=0 (default: 0, expose GPU 0)
+- COMPUTE_TYPE=float16 (default: float16 for GPU speed)
+
+If you have multiple GPUs:
+- Check available GPUs: docker compose exec worker nvidia-smi
+- Set CUDA_DEVICE_INDEX to desired GPU index (0, 1, etc.)
+- Set CUDA_VISIBLE_DEVICES to expose specific GPUs (e.g., "0,1")
+
+VERIFY GPU USAGE
+----------------
+1. Check diagnostics endpoint:
+   curl "http://localhost:8000/api/diagnostics?token=your_token"
+
+2. Check selftest:
+   curl "http://localhost:8000/api/selftest?token=your_token"
+
+3. Watch worker logs during transcription:
+   docker compose logs -f worker
+   Look for lines like: "Model loaded successfully on cuda:1"
+
+4. Check nvidia-smi inside container:
+   docker compose exec worker nvidia-smi
+
+TESTING ENDPOINTS
+-----------------
+Upload file:
+  curl -X POST "http://localhost:8000/api/upload?token=TOKEN" \
+    -F "audio=@test.wav" -F "language=en"
+
+List jobs:
+  curl "http://localhost:8000/api/jobs?token=TOKEN"
+
+Get job status:
+  curl "http://localhost:8000/api/jobs/SESSION_ID?token=TOKEN"
+
+Cancel job:
+  curl -X POST "http://localhost:8000/api/jobs/SESSION_ID/cancel?token=TOKEN"
+
+ARCHITECTURE
+------------
+- web: FastAPI server (no heavy processing, only queue management)
+- worker: GPU transcription worker (reads from Redis queue)
+- redis: Job queue (FIFO, concurrency=1 by default)
+- proxy: Caddy reverse proxy with HTTPS
+
+Upload flow:
+1. Client uploads audio -> web service
+2. web saves file to /data/sessions/SESSION_ID/audio.wav
+3. web enqueues job to Redis
+4. web returns immediately (non-blocking)
+5. worker pops job from Redis
+6. worker runs GPU transcription
+7. worker saves results to /data/sessions/SESSION_ID/
+8. Client polls /api/jobs/SESSION_ID for status
+
+CONFIGURATION LIMITS
+--------------------
+MAX_UPLOAD_MB=200 (file size limit)
+MAX_QUEUE=20 (max queued jobs before rejecting new uploads)
+MAX_WORKERS=1 (transcription concurrency, keep at 1 for GPU)
+
+TROUBLESHOOTING
+---------------
+Upload hangs:
+- Check worker logs: docker compose logs worker
+- Verify Redis: docker compose exec redis redis-cli ping
+- Check queue: docker compose exec redis redis-cli llen transcription_jobs
+
+GPU not used:
+- Run diagnostics: curl localhost:8000/api/diagnostics?token=TOKEN
+- Check CUDA_DEVICE_INDEX matches your GPU
+- Verify nvidia-smi shows GPU inside container
+- Check worker startup logs for smoke test result
+
+Queue stuck:
+- Clear queue: docker compose exec redis redis-cli del transcription_jobs
+- Restart worker: docker compose restart worker
+
+FILES CHANGED
+-------------
+server/main.py - Added /api/selftest, /api/diagnostics, /api/jobs, upload streaming
+server/transcription.py - GPU selection, smoke test, device diagnostics
+server/worker.py - GPU diagnostics on startup, cancellation check
+server/templates/index.html - Jobs queue panel, diagnostics panel
+docker-compose.yml - GPU env vars (CUDA_DEVICE_INDEX, FORCE_DEVICE, etc)
+
+ENDPOINTS
+---------
+GET  /api/health - Health check
+GET  /api/selftest - Quick GPU test (<2s)
+GET  /api/diagnostics - Full system diagnostics
+GET  /api/jobs - List all jobs
+GET  /api/jobs/{id} - Job status
+POST /api/jobs/{id}/cancel - Cancel job
+POST /api/upload - Upload audio
+GET  /api/sessions - List sessions
+GET  /session/{id} - View session details
+
+All endpoints require ?token=AUTH_TOKEN parameter.

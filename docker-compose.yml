@@ -1,0 +1,96 @@
+services:
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - internal
+
+  web:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"  # Internal only, not exposed externally
+    volumes:
+      - ./data:/data
+      - ./models:/models
+    environment:
+      - SESSIONS_DIR=/data/sessions
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_QUEUE=transcription_jobs
+      - AUTH_TOKEN=${AUTH_TOKEN}
+      - AUTH_QUERY_PARAM=${AUTH_QUERY_PARAM:-token}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+
+  worker:
+    build:
+      context: ./server
+      dockerfile: Dockerfile.worker
+    volumes:
+      - ./data:/data
+      - ./models:/models
+    environment:
+      - SESSIONS_DIR=/data/sessions
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_QUEUE=transcription_jobs
+      - WHISPER_MODEL=small
+      # GPU configuration
+      - FORCE_DEVICE=${FORCE_DEVICE:-cuda}
+      - CUDA_DEVICE_INDEX=${CUDA_DEVICE_INDEX:-0}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - COMPUTE_TYPE=${COMPUTE_TYPE:-float16}
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      - WORKER_CONCURRENCY=${MAX_WORKERS:-1}
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-200}
+      - MAX_QUEUE=${MAX_QUEUE:-20}
+      - HF_HOME=/models
+      - HUGGINGFACE_HUB_CACHE=/models
+      - TRANSFORMERS_CACHE=/models
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - internal
+
+  proxy:
+    image: caddy:2-alpine
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/certs:/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    networks:
+      - internal
+
+volumes:
+  redis_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
+    driver: bridge

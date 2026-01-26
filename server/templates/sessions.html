@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sessions - Voice Transcript</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1000px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background: #f8f9fa;
+            font-weight: bold;
+            color: #555;
+        }
+        tr:hover {
+            background: #f8f9fa;
+        }
+        .status {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .status.pending { background: #fff3cd; color: #856404; }
+        .status.uploading { background: #d1ecf1; color: #0c5460; }
+        .status.processing { background: #d1ecf1; color: #0c5460; }
+        .status.done { background: #d4edda; color: #155724; }
+        .status.error { background: #f8d7da; color: #721c24; }
+        a {
+            color: #007bff;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        .links {
+            margin-bottom: 20px;
+        }
+        .links a {
+            margin-right: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📋 Sessions</h1>
+        
+        <div class="links">
+            <a href="/{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}">← Upload New</a>
+        </div>
+        
+        {% if sessions %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Session ID</th>
+                    <th>Status</th>
+                    <th>Created At</th>
+                    <th>Duration</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for session in sessions %}
+                <tr>
+                    <td><code>{{ session.session_id[:8] }}...</code></td>
+                    <td><span class="status {{ session.status }}">{{ session.status }}</span></td>
+                    <td>{{ session.created_at or 'N/A' }}</td>
+                    <td>{{ "%.1f"|format(session.duration) if session.duration else 'N/A' }}s</td>
+                    <td><a href="/session/{{ session.session_id }}{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}">View</a></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p>No sessions found. <a href="/">Upload your first audio file</a>.</p>
+        {% endif %}
+    </div>
+</body>
+</html>

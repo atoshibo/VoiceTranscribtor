@@ -1,0 +1,47 @@
+# Data and models (large files, should not be in git)
+data/
+models/
+
+# Secrets and environment
+.env
+.env.local
+
+# Claude Code metadata
+.claude/
+
+# Android
+android/.gradle/
+android/.idea/
+android/local.properties
+android/*.iml
+android/app/build/
+android/build/
+android/.cxx/
+android/.externalNativeBuild/
+
+# Python
+server/__pycache__/
+server/*.pyc
+server/.venv/
+server/venv/
+server/data/
+*.pyc
+__pycache__/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Temporary files
+*.tmp
+*.log
+

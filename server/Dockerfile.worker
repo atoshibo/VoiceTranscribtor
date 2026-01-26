@@ -1,0 +1,41 @@
+FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv python3-dev \
+    ca-certificates \
+    build-essential \
+    pkg-config \
+    libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
+    libswscale-dev libswresample-dev libavfilter-dev \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps
+COPY requirements-worker.txt /app/requirements.txt
+RUN python3 -m pip install --upgrade pip setuptools wheel && \
+    python3 -m pip install --default-timeout=300 --retries=10 \
+    fastapi==0.104.1 \
+    uvicorn==0.24.0 \
+    python-multipart==0.0.6 \
+    jinja2==3.1.2 \
+    redis==5.0.1 && \
+    python3 -m pip install --default-timeout=300 --retries=10 av==11.0.0 && \
+    python3 -m pip install --default-timeout=300 --retries=10 faster-whisper==0.10.0 && \
+    python3 -m pip install --default-timeout=300 --retries=10 torch torchaudio --index-url https://download.pytorch.org/whl/cu121 && \
+    python3 -m pip install --default-timeout=300 --retries=10 pyannote.audio==3.1.1 ffmpeg-python==0.2.0 && \
+    python3 -m pip install --default-timeout=300 --retries=10 --force-reinstall "numpy<2.0,>=1.23"
+
+# Copy server code (worker needs all modules)
+COPY transcription.py diarization.py audio_preprocess.py worker.py /app/
+
+# Cache models on a volume
+ENV HF_HOME=/models
+ENV TRANSFORMERS_CACHE=/models
+ENV HUGGINGFACE_HUB_CACHE=/models
+ENV SESSIONS_DIR=/data/sessions
+
+EXPOSE 8000
+CMD ["python3", "worker.py"]
