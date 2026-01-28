@@ -931,11 +931,11 @@ async def download_file(session_id: str, filename: str):
     # Security: prevent path traversal
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
-    
+
     session_dir = SESSIONS_DIR / session_id
     if not session_dir.exists():
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     # Load metadata for original filename
     metadata_path = session_dir / "metadata.json"
     original_filename = "audio.wav"
@@ -943,31 +943,39 @@ async def download_file(session_id: str, filename: str):
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
             original_filename = metadata.get("original_filename", "audio.wav")
-    
-    # Extract base name without extension
+
+    # Extract base name without extension and sanitize for ASCII
     base_name = Path(original_filename).stem
-    
-    # Map internal filenames to user-friendly names with original filename
+
+    # Sanitize base_name to ASCII-safe characters (replace non-ASCII with underscore)
+    try:
+        base_name.encode('ascii')
+        safe_base_name = base_name
+    except UnicodeEncodeError:
+        # Use session_id as safe fallback for non-ASCII filenames
+        safe_base_name = session_id[:8]
+
+    # Map internal filenames to user-friendly names with sanitized base name
     file_mapping = {
-        "audio.wav": f"{base_name}.wav",
-        "transcript.txt": f"TRANSC{base_name}.txt",
-        "transcript_by_speaker.txt": f"TRANSC{base_name}.txt",
-        "transcript_by_speaker.json": f"TRANSC{base_name}.json",
-        "transcript_timestamps.json": f"TRANSC{base_name}_timestamps.json",
-        "subtitles.srt": f"SUB{base_name}.srt",
-        "subtitles.vtt": f"SUB{base_name}.vtt",
-        "summary.json": f"{base_name}_summary.json",
-        "analytics.json": f"{base_name}_analytics.json"
+        "audio.wav": f"{safe_base_name}.wav",
+        "transcript.txt": f"TRANSC_{safe_base_name}.txt",
+        "transcript_by_speaker.txt": f"TRANSC_{safe_base_name}.txt",
+        "transcript_by_speaker.json": f"TRANSC_{safe_base_name}.json",
+        "transcript_timestamps.json": f"TRANSC_{safe_base_name}_timestamps.json",
+        "subtitles.srt": f"SUB_{safe_base_name}.srt",
+        "subtitles.vtt": f"SUB_{safe_base_name}.vtt",
+        "summary.json": f"{safe_base_name}_summary.json",
+        "analytics.json": f"{safe_base_name}_analytics.json"
     }
-    
+
     # Check if requesting a mapped file
     download_filename = file_mapping.get(filename, filename)
     file_path = session_dir / filename
-    
+
     # Allow all files in session directory (with security check)
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    
+
     # Determine media type
     ext = Path(download_filename).suffix.lower()
     media_types = {
@@ -978,7 +986,8 @@ async def download_file(session_id: str, filename: str):
         ".vtt": "text/vtt"
     }
     media_type = media_types.get(ext, "application/octet-stream")
-    
+
+    # Use safe ASCII filename for Content-Disposition header
     return FileResponse(
         path=str(file_path),
         filename=download_filename,
