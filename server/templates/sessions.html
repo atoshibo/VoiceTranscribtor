@@ -64,22 +64,51 @@
         .links a {
             margin-right: 20px;
         }
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background: #e9ecef;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4CAF50, #45a049);
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        .progress-text {
+            position: absolute;
+            width: 100%;
+            text-align: center;
+            line-height: 20px;
+            font-size: 11px;
+            color: #333;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>📋 Sessions</h1>
-        
+
         <div class="links">
             <a href="/{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}">← Upload New</a>
+            <a href="#" onclick="location.reload(); return false;">🔄 Refresh</a>
         </div>
-        
+
         {% if sessions %}
         <table>
             <thead>
                 <tr>
                     <th>Session ID</th>
                     <th>Status</th>
+                    <th>Progress</th>
                     <th>Created At</th>
                     <th>Duration</th>
                     <th>Action</th>
@@ -87,9 +116,14 @@
             </thead>
             <tbody>
                 {% for session in sessions %}
-                <tr>
+                <tr data-session-id="{{ session.session_id }}" data-status="{{ session.status }}">
                     <td><code>{{ session.session_id[:8] }}...</code></td>
                     <td><span class="status {{ session.status }}">{{ session.status }}</span></td>
+                    <td>
+                        <div class="progress-bar">
+                            <div class="progress-fill" style="width: 0%" data-progress="0">0%</div>
+                        </div>
+                    </td>
                     <td>{{ session.created_at or 'N/A' }}</td>
                     <td>{{ "%.1f"|format(session.duration) if session.duration else 'N/A' }}s</td>
                     <td><a href="/session/{{ session.session_id }}{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}">View</a></td>
@@ -101,5 +135,78 @@
         <p>No sessions found. <a href="/">Upload your first audio file</a>.</p>
         {% endif %}
     </div>
+
+    <script>
+        const AUTH_TOKEN = "{{ auth_token or '' }}";
+        const AUTH_QUERY_PARAM = "{{ auth_query_param or 'token' }}";
+
+        function withToken(url) {
+            if (!AUTH_TOKEN) return url;
+            const separator = url.includes('?') ? '&' : '?';
+            return url + separator + AUTH_QUERY_PARAM + '=' + encodeURIComponent(AUTH_TOKEN);
+        }
+
+        async function updateProgress() {
+            const rows = document.querySelectorAll('tr[data-session-id]');
+            let hasActiveJobs = false;
+
+            for (const row of rows) {
+                const sessionId = row.getAttribute('data-session-id');
+                const status = row.getAttribute('data-status');
+
+                // Only update if processing/running
+                if (status === 'processing' || status === 'running' || status === 'uploaded') {
+                    hasActiveJobs = true;
+                    try {
+                        const response = await fetch(withToken(`/api/jobs/${sessionId}`));
+                        const data = await response.json();
+
+                        const progress = data.progress || {};
+                        const procPercent = progress.processing || 0;
+                        const stage = progress.stage || 'unknown';
+
+                        const progressFill = row.querySelector('.progress-fill');
+                        if (progressFill) {
+                            progressFill.style.width = procPercent + '%';
+                            progressFill.textContent = procPercent + '% - ' + stage;
+                        }
+
+                        // Update status badge if changed
+                        if (data.status !== status) {
+                            row.setAttribute('data-status', data.status);
+                            const statusBadge = row.querySelector('.status');
+                            if (statusBadge) {
+                                statusBadge.className = 'status ' + data.status;
+                                statusBadge.textContent = data.status;
+                            }
+
+                            // If completed, show 100%
+                            if (data.status === 'done') {
+                                progressFill.style.width = '100%';
+                                progressFill.textContent = '100% - completed';
+                            }
+                        }
+                    } catch (err) {
+                        console.error('Error updating progress:', err);
+                    }
+                } else if (status === 'done') {
+                    // Show 100% for completed
+                    const progressFill = row.querySelector('.progress-fill');
+                    if (progressFill) {
+                        progressFill.style.width = '100%';
+                        progressFill.textContent = '100% - completed';
+                    }
+                }
+            }
+
+            // Auto-refresh if there are active jobs
+            if (hasActiveJobs) {
+                setTimeout(updateProgress, 3000); // Refresh every 3 seconds
+            }
+        }
+
+        // Initial progress update
+        document.addEventListener('DOMContentLoaded', updateProgress);
+    </script>
 </body>
 </html>

@@ -3,9 +3,7 @@ VOICE RECORD TRANSCRIPTOR - SYSTEM NOTES
 
 QUICK START
 -----------
-1. Set AUTH_TOKEN environment variable:
-   Windows: set AUTH_TOKEN=your_secret_token_here
-   Linux:   export AUTH_TOKEN=your_secret_token_here
+1. Set AUTH_TOKEN in .env file
 
 2. Start services:
    docker compose up -d --build
@@ -28,6 +26,17 @@ If you have multiple GPUs:
 - Check available GPUs: docker compose exec worker nvidia-smi
 - Set CUDA_DEVICE_INDEX to desired GPU index (0, 1, etc.)
 - Set CUDA_VISIBLE_DEVICES to expose specific GPUs (e.g., "0,1")
+
+SPEAKER DIARIZATION
+-------------------
+Speaker diarization uses fully local audio feature clustering:
+- No external services or authentication required
+- Uses MFCC features + K-means clustering
+- Automatically detects 2-3 speakers by default
+- Completely GPU/CPU local processing
+
+The system analyzes voice characteristics (pitch, timbre, etc.) to identify
+different speakers and labels them as SPEAKER_00, SPEAKER_01, etc.
 
 VERIFY GPU USAGE
 ----------------

@@ -33,6 +33,7 @@
         .status.pending { background: #fff3cd; color: #856404; }
         .status.uploading { background: #d1ecf1; color: #0c5460; }
         .status.processing { background: #d1ecf1; color: #0c5460; }
+        .status.running { background: #d1ecf1; color: #0c5460; }
         .status.done { background: #d4edda; color: #155724; }
         .status.error { background: #f8d7da; color: #721c24; }
         .status.cancelled { background: #ffeaa7; color: #856404; }
@@ -178,23 +179,23 @@
             <p style="color: #856404;">This transcription was cancelled.</p>
             <a href="/{% if auth_token %}?{{ auth_query_param }}={{ auth_token }}{% endif %}" class="download-btn" style="display: inline-block; margin-top: 10px;">Upload New File</a>
         </div>
-        {% elif status == "processing" or status == "uploaded" %}
+        {% elif status == "processing" or status == "uploaded" or status == "running" %}
         <div class="section" id="progressSection">
             <h2>📊 Progress</h2>
             <div style="margin: 20px 0;">
                 <div style="margin-bottom: 15px;">
-                    <strong>Upload:</strong> 
-                    <span id="uploadProgress">100%</span>
+                    <strong>Upload:</strong>
+                    <span id="uploadProgress">{{ progress.upload or 100 }}%</span>
                     <div style="background: #e0e0e0; height: 25px; border-radius: 10px; margin-top: 5px; position: relative;">
-                        <div style="background: #4CAF50; height: 100%; width: 100%; border-radius: 10px; text-align: center; line-height: 25px; color: white; font-size: 14px; font-weight: bold;">100%</div>
+                        <div style="background: #4CAF50; height: 100%; width: {{ progress.upload or 100 }}%; border-radius: 10px; text-align: center; line-height: 25px; color: white; font-size: 14px; font-weight: bold;">{{ progress.upload or 100 }}%</div>
                     </div>
                 </div>
                 <div style="margin-bottom: 15px;">
-                    <strong>Processing:</strong> 
-                    <span id="processingProgress" style="font-weight: bold; font-size: 16px; color: #2196F3;">0%</span>
-                    <span id="stageText" style="color: #666; margin-left: 10px;">- starting</span>
+                    <strong>Processing:</strong>
+                    <span id="processingProgress" style="font-weight: bold; font-size: 16px; color: #2196F3;">{{ progress.processing or 0 }}%</span>
+                    <span id="stageText" style="color: #666; margin-left: 10px;">- {{ progress.stage or 'starting' }}</span>
                     <div style="background: #e0e0e0; height: 25px; border-radius: 10px; margin-top: 5px; position: relative;">
-                        <div id="processingBar" style="background: #2196F3; height: 100%; width: 0%; border-radius: 10px; text-align: center; line-height: 25px; color: white; font-size: 14px; font-weight: bold; transition: width 0.3s;">0%</div>
+                        <div id="processingBar" style="background: #2196F3; height: 100%; width: {{ progress.processing or 0 }}%; border-radius: 10px; text-align: center; line-height: 25px; color: white; font-size: 14px; font-weight: bold; transition: width 0.3s;">{{ progress.processing or 0 }}%</div>
                     </div>
                 </div>
                 <div style="margin-top: 20px;">
@@ -222,34 +223,62 @@
             
             function updateProgress() {
                 fetch(withToken(`/api/session/${sessionId}`))
-                    .then(r => r.json())
+                    .then(r => {
+                        if (!r.ok) {
+                            throw new Error('HTTP ' + r.status);
+                        }
+                        return r.json();
+                    })
                     .then(data => {
-                        const progress = data.progress || {upload: 0, processing: 0, stage: 'unknown'};
-                        
-                        // Always show percentages
-                        document.getElementById('uploadProgress').textContent = progress.upload + '%';
-                        document.getElementById('processingProgress').textContent = progress.processing + '%';
-                        document.getElementById('stageText').textContent = ' - ' + (progress.stage || 'processing');
-                        
-                        const processingBar = document.getElementById('processingBar');
-                        processingBar.style.width = progress.processing + '%';
-                        processingBar.textContent = progress.processing + '%';
-                        
+                        console.log('Progress update received:', data);
+
+                        if (!data || !data.progress) {
+                            console.warn('No progress data received, keeping current values');
+                            return;
+                        }
+
+                        const progress = data.progress;
+                        console.log('Progress data:', progress);
+
+                        // Only update if we have valid values (don't reset to 0)
+                        if (typeof progress.upload === 'number') {
+                            document.getElementById('uploadProgress').textContent = progress.upload + '%';
+                        }
+
+                        if (typeof progress.processing === 'number') {
+                            document.getElementById('processingProgress').textContent = progress.processing + '%';
+                            const processingBar = document.getElementById('processingBar');
+                            if (processingBar) {
+                                processingBar.style.width = progress.processing + '%';
+                                processingBar.textContent = progress.processing + '%';
+                            }
+                        }
+
+                        if (progress.stage) {
+                            document.getElementById('stageText').textContent = ' - ' + progress.stage;
+                        }
+
+                        // Handle status changes
                         if (data.status === 'done') {
                             clearInterval(pollInterval);
                             location.reload();
                         } else if (data.status === 'error') {
                             clearInterval(pollInterval);
-                            document.getElementById('cancelBtn').style.display = 'none';
+                            const cancelBtn = document.getElementById('cancelBtn');
+                            if (cancelBtn) cancelBtn.style.display = 'none';
                             alert('Transcription failed: ' + (data.error || 'Unknown error'));
                         } else if (data.status === 'cancelled') {
                             clearInterval(pollInterval);
-                            document.getElementById('cancelBtn').style.display = 'none';
+                            const cancelBtn = document.getElementById('cancelBtn');
+                            if (cancelBtn) cancelBtn.style.display = 'none';
                             alert('Transcription cancelled');
                             location.reload();
                         }
                     })
-                    .catch(err => console.error('Progress update error:', err));
+                    .catch(err => {
+                        console.error('Progress update error:', err);
+                        // Don't clear interval on error - keep trying
+                    });
             }
             
             function cancelTranscription() {
@@ -273,9 +302,17 @@
                 }
             }
             
-            // Poll every 2 seconds
-            pollInterval = setInterval(updateProgress, 2000);
-            updateProgress(); // Initial update
+            // Verify elements exist before starting polling
+            if (!document.getElementById('uploadProgress') ||
+                !document.getElementById('processingProgress') ||
+                !document.getElementById('processingBar')) {
+                console.error('Progress elements not found in DOM!');
+            } else {
+                console.log('Progress elements found, starting polling for session:', sessionId);
+                // Poll every 2 seconds
+                pollInterval = setInterval(updateProgress, 2000);
+                updateProgress(); // Initial update
+            }
         </script>
         {% elif status == "done" %}
         

@@ -406,10 +406,18 @@ async def session_detail(request: Request, session_id: str):
             with open(analytics_path, "r", encoding="utf-8") as f:
                 analytics = json.load(f)
     
+    # Get progress data
+    progress = status_data.get("progress", {
+        "upload": 100,
+        "processing": 0,
+        "stage": "starting"
+    })
+
     context = {
         "request": request,
         "session_id": session_id,
         "status": status_data.get("status"),
+        "progress": progress,
         "metadata": metadata,
         "transcript": transcript,
         "timestamps": timestamps,
@@ -947,13 +955,34 @@ async def download_file(session_id: str, filename: str):
     # Extract base name without extension and sanitize for ASCII
     base_name = Path(original_filename).stem
 
-    # Sanitize base_name to ASCII-safe characters (replace non-ASCII with underscore)
+    # Sanitize base_name to ASCII-safe characters
+    # First try to use as-is if already ASCII
     try:
         base_name.encode('ascii')
         safe_base_name = base_name
     except UnicodeEncodeError:
-        # Use session_id as safe fallback for non-ASCII filenames
-        safe_base_name = session_id[:8]
+        # Try transliterating Cyrillic characters to Latin
+        cyrillic_to_latin = {
+            'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
+            'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+            'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+            'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+            'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+            'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ё': 'Yo',
+            'Ж': 'Zh', 'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M',
+            'Н': 'N', 'О': 'O', 'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U',
+            'Ф': 'F', 'Х': 'H', 'Ц': 'Ts', 'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Sch',
+            'Ъ': '', 'Ы': 'Y', 'Ь': '', 'Э': 'E', 'Ю': 'Yu', 'Я': 'Ya'
+        }
+        transliterated = ''.join(cyrillic_to_latin.get(c, c) for c in base_name)
+
+        # Check if transliteration made it ASCII-safe
+        try:
+            transliterated.encode('ascii')
+            safe_base_name = transliterated
+        except UnicodeEncodeError:
+            # Still has non-ASCII characters, use session_id as fallback
+            safe_base_name = session_id[:8]
 
     # Map internal filenames to user-friendly names with sanitized base name
     file_mapping = {
