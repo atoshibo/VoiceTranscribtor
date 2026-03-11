@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
+FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     build-essential \
     pkg-config \
+    libcublas-12-3 \
     libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev \
     libswscale-dev libswresample-dev libavfilter-dev \
     ffmpeg \
@@ -37,6 +38,7 @@ ENV HF_HOME=/models
 ENV TRANSFORMERS_CACHE=/models
 ENV HUGGINGFACE_HUB_CACHE=/models
 ENV SESSIONS_DIR=/data/sessions
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 CMD ["python3", "worker.py"]

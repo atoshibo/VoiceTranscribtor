@@ -16,7 +16,17 @@ QUICK START
 
 GPU CONFIGURATION
 -----------------
-Force specific GPU via environment variables in docker-compose.yml:
+GPU-only mode is enabled by default. CPU fallback is **not** used for Whisper.
+
+Configure GPU via environment variables in docker-compose.yml:
+- WHISPER_DEVICE=cuda (default: cuda, required for GPU-only mode)
+- WHISPER_STRICT_CUDA=1 (default: 1)
+  - When 1, any CUDA init error will cause jobs (and, on startup, the worker) to fail fast.
+- WHISPER_COMPUTE_TYPE_CUDA=float16|int8_float16|... (default: float16)
+- WHISPER_COMPUTE_TYPE_CUDA_FALLBACKS=int8_float16,int8 (tried on CUDA **only**, never CPU)
+- WHISPER_COMPUTE_TYPE_CPU=int8|int8_float32|... (legacy / diagnostics only)
+
+Legacy env vars are still understood for backwards compatibility (but CPU is not used for transcription):
 - FORCE_DEVICE=cuda or cpu (default: cuda)
 - CUDA_DEVICE_INDEX=0 (default: 0, use first GPU)
 - CUDA_VISIBLE_DEVICES=0 (default: 0, expose GPU 0)
@@ -46,12 +56,32 @@ VERIFY GPU USAGE
 2. Check selftest:
    curl "http://localhost:8000/api/selftest?token=your_token"
 
-3. Watch worker logs during transcription:
-   docker compose logs -f worker
-   Look for lines like: "Model loaded successfully on cuda:1"
+3. Check v2 health (GPU correctness):
+   curl "http://localhost:8000/api/v2/health"
+   # Look at: gpu_available, gpu_reason, selected_compute_type, strict_cuda
 
-4. Check nvidia-smi inside container:
+4. Watch worker logs during transcription:
+   docker compose logs -f worker
+   Look for lines like: "Model loaded OK on cuda:0 compute_type=float16"
+
+5. Check nvidia-smi inside container:
    docker compose exec worker nvidia-smi
+
+If you see errors like:
+- "CUDA driver version is insufficient for CUDA runtime version"
+it means the container CUDA runtime is newer than the host NVIDIA driver.
+
+Fix options:
+1. Upgrade NVIDIA driver on the host to match the container CUDA runtime.
+2. Use a container image built with an older CUDA runtime compatible with the host driver.
+
+If you see errors like:
+- "libcuda.so: cannot open shared object file" or "no CUDA-capable device is detected"
+it means the container is not getting GPU access.
+
+Fix options:
+1. Ensure Docker is started with GPU support (e.g. `docker run --gpus all` or compose device reservations).
+2. Install and configure `nvidia-container-toolkit` on the host.
 
 TESTING ENDPOINTS
 -----------------

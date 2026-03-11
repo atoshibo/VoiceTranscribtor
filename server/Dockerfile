@@ -11,11 +11,12 @@ COPY requirements.txt /app/requirements.txt
 RUN python3 -m pip install --upgrade pip setuptools wheel && \
     python3 -m pip install --default-timeout=300 --retries=10 -r requirements.txt
 
-# Copy server code
+# Copy server code (no templates — browser UI removed)
 COPY main.py /app/
-COPY templates/ /app/templates/
+COPY api_v2.py /app/
 
 ENV SESSIONS_DIR=/data/sessions
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -203,6 +203,38 @@ def generate_subtitles_with_speakers(session_dir: Path, aligned_segments: list) 
 # -----------------------------
 # Job processing
 # -----------------------------
+def _derive_action_hint(error_msg: str) -> str:
+    """Return a short, actionable hint based on a CUDA-related error message."""
+    msg = (error_msg or "").lower()
+
+    if "driver version is insufficient" in msg:
+        return (
+            "CUDA driver version is insufficient for the container CUDA runtime. "
+            "Update the NVIDIA driver on the host to a version compatible with this container, "
+            "or use a container image built with an older CUDA runtime. Verify with `nvidia-smi` "
+            "inside the worker container."
+        )
+
+    if "libcuda.so" in msg or "no cuda-capable device" in msg or "no cuda capable device" in msg:
+        return (
+            "No CUDA-capable GPU is visible inside the container. Ensure Docker is started with GPU "
+            "access (e.g. `--gpus all` or compose device reservations) and that nvidia-container-toolkit "
+            "is installed and configured on the host."
+        )
+
+    if "float16" in msg and "do not support efficient float16" in msg:
+        return (
+            "The configured CUDA compute_type=float16 is not supported efficiently on this GPU. "
+            "Set WHISPER_COMPUTE_TYPE_CUDA to a supported value such as int8_float16 or int8, "
+            "then restart the worker."
+        )
+
+    return (
+        "GPU initialization failed. Check that the host NVIDIA driver, CUDA runtime inside the "
+        "container, and Docker GPU configuration are compatible. See SYSTEM_NOTES for GPU setup steps."
+    )
+
+
 def process_transcription_job(job_data: Dict[str, Any]) -> None:
     session_id = job_data["session_id"]
     session_dir = SESSIONS_DIR / session_id
@@ -235,7 +267,8 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        language = job_data.get("language", metadata.get("language", "en"))
+        # None → faster-whisper auto-detects language; never fall back to "en" by default.
+        language = job_data.get("language") or metadata.get("language") or None
         speaker_count = int(job_data.get("speaker_count", metadata.get("speaker_count", 1)))
         model_size = job_data.get("model_size", metadata.get("model_size", "base"))
         timestamps_enabled = bool(job_data.get("timestamps", metadata.get("timestamps", True)))
@@ -334,7 +367,20 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
     except Exception as e:
         error_msg = str(e)
         print(f"[{session_id}] Transcription error: {error_msg}")
+        tb_str = traceback.format_exc()
         traceback.print_exc()
+
+        # Write detailed error.json for API v2 and diagnostics
+        error_payload: Dict[str, Any] = {
+            "error_type": type(e).__name__,
+            "error_message": error_msg,
+            "traceback": tb_str,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "stage": "transcription",
+            "action_hint": _derive_action_hint(error_msg),
+        }
+        _atomic_write_json(session_dir / "error.json", error_payload)
+
         update_session_status(
             session_id,
             STATUS_ERROR,
@@ -368,6 +414,46 @@ def main() -> None:
             else:
                 print(f"Failed to connect to Redis after {max_retries} attempts: {e}")
                 sys.exit(1)
+
+    # GPU health check on startup — fail fast in strict CUDA mode
+    try:
+        from transcription import probe_cuda_health  # type: ignore
+
+        cuda_health = probe_cuda_health()
+        strict_cuda = bool(cuda_health.get("strict_cuda"))
+        gpu_available = bool(cuda_health.get("gpu_available"))
+        gpu_reason = cuda_health.get("gpu_reason")
+        selected_compute_type = cuda_health.get("selected_compute_type")
+
+        print(
+            f"[GPU-HEALTH] strict_cuda={strict_cuda} "
+            f"gpu_available={gpu_available} "
+            f"selected_compute_type={selected_compute_type} "
+            f"reason={gpu_reason}"
+        )
+
+        if strict_cuda and not gpu_available:
+            print(
+                "[GPU-HEALTH] GPU unavailable in strict CUDA mode; "
+                f"failing worker startup: {gpu_reason}"
+            )
+            sys.exit(1)
+
+        # Write worker health to shared /data so the web service can report it
+        try:
+            health_path = SESSIONS_DIR.parent / "worker_health.json"
+            _atomic_write_json(health_path, {
+                "gpu_available": gpu_available,
+                "gpu_reason": gpu_reason,
+                "selected_compute_type": selected_compute_type,
+                "strict_cuda": strict_cuda,
+                "worker_started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[GPU-HEALTH] Failed to run CUDA health check: {e}")
 
     while True:
         try:

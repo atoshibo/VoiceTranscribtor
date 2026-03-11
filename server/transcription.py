@@ -1,40 +1,161 @@
+"""
+Whisper transcription wrapper.
+
+Device selection is env-driven and deterministic:
+  WHISPER_DEVICE         cuda | cpu  (default: cuda)
+  WHISPER_STRICT_CUDA    1 | 0       (default: 1 — fail if GPU unavailable)
+  CUDA_DEVICE_INDEX      int         (default: 0)
+  WHISPER_COMPUTE_TYPE_CUDA          (default: float16)
+  WHISPER_MODEL          model size  (default: small)
+"""
 import os
 import subprocess
-from faster_whisper import WhisperModel
-from typing import List, Dict, Tuple, Optional, Callable
-import re
 import math
+import re
+from typing import List, Dict, Tuple, Optional, Callable, Any
 
-# Initialize model (load on first use, per model size)
-_model_cache: Dict[str, WhisperModel] = {}
-_device_diagnostics: Dict = {}
+from faster_whisper import WhisperModel
+
+# ---------------------------------------------------------------------------
+# Configuration (read once at import time)
+# ---------------------------------------------------------------------------
+DEVICE: str = os.getenv("WHISPER_DEVICE", "cuda").lower().strip()
+DEVICE_INDEX: int = int(os.getenv("CUDA_DEVICE_INDEX", "0"))
+COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE_CUDA", "float16").lower().strip()
+STRICT_CUDA: bool = os.getenv("WHISPER_STRICT_CUDA", "1").strip() == "1"
+DEFAULT_MODEL: str = os.getenv("WHISPER_MODEL", "small")
+
+# Enforce strict: cuda is the only allowed device
+if STRICT_CUDA and DEVICE != "cuda":
+    print(f"[WHISPER-CONFIG] WHISPER_STRICT_CUDA=1 — forcing DEVICE=cuda (was {DEVICE!r})")
+    DEVICE = "cuda"
+
+# ---------------------------------------------------------------------------
+# Omi/chunked-audio transcription tuning
+# These defaults reduce hallucination loops on sparse/BLE recordings.
+# Override via environment variables if needed.
+# ---------------------------------------------------------------------------
+# condition_on_previous_text=True is the main culprit for repetition loops.
+# Default off for Omi; set OMI_WHISPER_CONDITION_ON_PREVIOUS_TEXT=1 to re-enable.
+_CONDITION_ON_PREV: bool = os.getenv("OMI_WHISPER_CONDITION_ON_PREVIOUS_TEXT", "0") == "1"
+# beam_size=1 (greedy) eliminates beam-search induced repetition on sparse audio.
+_BEAM_SIZE: int = int(os.getenv("OMI_WHISPER_BEAM_SIZE", "1"))
+# best_of=1 disables sampling fallbacks that can loop.
+_BEST_OF: int = int(os.getenv("OMI_WHISPER_BEST_OF", "1"))
+# Max consecutive identical segments before suppressing — catches remaining loops.
+_MAX_REPEAT_SEGS: int = int(os.getenv("OMI_WHISPER_MAX_REPEAT_SEGMENTS", "2"))
+
+# ---------------------------------------------------------------------------
+# Model cache: (model_size, device, compute_type) → WhisperModel
+# ---------------------------------------------------------------------------
+_model_cache: Dict[Tuple[str, str, str], WhisperModel] = {}
+
+# Cached result of probe_cuda_health()
+_cuda_health: Optional[Dict[str, Any]] = None
 
 
-def get_device_diagnostics() -> Dict:
-    """Get diagnostic info about available compute devices."""
-    global _device_diagnostics
-    if _device_diagnostics:
-        return _device_diagnostics
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+def get_model(
+    model_size: str = None,
+    device: str = None,
+    compute_type: str = None,
+) -> WhisperModel:
+    """
+    Return a cached WhisperModel. Loads on first call.
 
-    diag = {
-        "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
-        "force_device": os.getenv("FORCE_DEVICE"),
-        "cuda_device_index": os.getenv("CUDA_DEVICE_INDEX"),
-        "compute_type": os.getenv("COMPUTE_TYPE"),
+    Uses module-level DEVICE / DEVICE_INDEX / COMPUTE_TYPE unless overridden.
+    Raises RuntimeError with a clear message on failure.
+    """
+    model_size = model_size or DEFAULT_MODEL
+    device = (device or DEVICE).lower()
+    compute_type = compute_type or (COMPUTE_TYPE if device == "cuda" else "int8")
+    key = (model_size, device, compute_type)
+
+    if key in _model_cache:
+        return _model_cache[key]
+
+    print(f"[WHISPER] Loading model={model_size} device={device}:{DEVICE_INDEX} compute_type={compute_type}")
+    kwargs: Dict[str, Any] = {"device": device, "compute_type": compute_type}
+    if device == "cuda":
+        kwargs["device_index"] = DEVICE_INDEX
+
+    try:
+        m = WhisperModel(model_size, **kwargs)
+        _model_cache[key] = m
+        print(f"[WHISPER] Model loaded OK")
+        return m
+    except Exception as e:
+        print(f"[WHISPER] Error loading model: {e}")
+        raise RuntimeError(
+            f"Failed to load Whisper model '{model_size}' on {device} (compute_type={compute_type}): {e}"
+        ) from e
+
+
+# ---------------------------------------------------------------------------
+# CUDA health probe (used by worker startup and /api/v2/health)
+# ---------------------------------------------------------------------------
+def probe_cuda_health(model_size: str = "tiny") -> Dict[str, Any]:
+    """
+    Check CUDA availability by loading a tiny Whisper model on GPU.
+    Result is cached after the first call.
+
+    Returns:
+        {gpu_available, gpu_reason, selected_compute_type, strict_cuda}
+    """
+    global _cuda_health
+    if _cuda_health is not None:
+        return _cuda_health
+
+    result: Dict[str, Any] = {
+        "gpu_available": False,
+        "gpu_reason": None,
+        "selected_device": "cuda",
+        "selected_compute_type": COMPUTE_TYPE,
+        "strict_cuda": STRICT_CUDA,
+    }
+
+    print(f"[WHISPER] Probing CUDA with model={model_size} compute_type={COMPUTE_TYPE}")
+    try:
+        _ = WhisperModel(
+            model_size,
+            device="cuda",
+            compute_type=COMPUTE_TYPE,
+            device_index=DEVICE_INDEX,
+        )
+        result["gpu_available"] = True
+        print("[WHISPER] CUDA OK")
+    except Exception as e:
+        result["gpu_reason"] = str(e)
+        print(f"[WHISPER] CUDA probe failed: {e}")
+
+    _cuda_health = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics (used by /api/diagnostics)
+# ---------------------------------------------------------------------------
+def get_device_diagnostics() -> Dict[str, Any]:
+    """Return GPU diagnostic info: nvidia-smi output, ctranslate2, device config."""
+    diag: Dict[str, Any] = {
+        "device": DEVICE,
+        "device_index": DEVICE_INDEX,
+        "compute_type": COMPUTE_TYPE,
+        "strict_cuda": STRICT_CUDA,
+        "model_default": DEFAULT_MODEL,
         "nvidia_smi_available": False,
         "nvidia_smi_output": "",
         "detected_gpus": [],
-        "selected_device": "unknown",
-        "ctranslate2_available": False
+        "ctranslate2_available": False,
     }
 
-    # Check nvidia-smi
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total", "--format=csv,noheader"],
-            capture_output=True,
-            timeout=3,
-            text=True
+            ["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader"],
+            capture_output=True, timeout=3, text=True,
         )
         if result.returncode == 0:
             diag["nvidia_smi_available"] = True
@@ -44,15 +165,14 @@ def get_device_diagnostics() -> Dict:
                 if len(parts) >= 2:
                     diag["detected_gpus"].append({
                         "index": parts[0],
-                        "name": parts[1] if len(parts) > 1 else "",
+                        "name": parts[1],
                         "utilization": parts[2] if len(parts) > 2 else "",
                         "memory_used": parts[3] if len(parts) > 3 else "",
-                        "memory_total": parts[4] if len(parts) > 4 else ""
+                        "memory_total": parts[4] if len(parts) > 4 else "",
                     })
     except Exception as e:
         diag["nvidia_smi_error"] = str(e)
 
-    # Check CTranslate2
     try:
         import ctranslate2  # noqa: F401
         diag["ctranslate2_available"] = True
@@ -60,298 +180,185 @@ def get_device_diagnostics() -> Dict:
     except Exception:
         pass
 
-    _device_diagnostics = diag
+    # Include cached health result if available
+    if _cuda_health is not None:
+        diag["cuda_health"] = _cuda_health
+
     return diag
 
 
-def select_device() -> Tuple[str, int, str]:
-    """
-    Select device based on environment variables.
-    Returns: (device, device_index, compute_type)
-    """
-    force_device = os.getenv("FORCE_DEVICE", "").lower().strip()
-    cuda_device_index = int(os.getenv("CUDA_DEVICE_INDEX", "0"))
-    compute_type = os.getenv("COMPUTE_TYPE", "").lower().strip()
-
-    # Force device override
-    if force_device == "cpu":
-        return "cpu", 0, (compute_type or "int8")
-
-    if force_device == "cuda":
-        ct = compute_type or "float16"
-        return "cuda", cuda_device_index, ct
-
-    # Auto-detect
-    cuda_visible = os.getenv("CUDA_VISIBLE_DEVICES")
-    if cuda_visible is not None:
-        ct = compute_type or "float16"
-        return "cuda", cuda_device_index, ct
-
-    # Check nvidia-smi
-    try:
-        result = subprocess.run(["nvidia-smi", "-L"], capture_output=True, timeout=2, text=True)
-        if result.returncode == 0 and "GPU" in result.stdout:
-            ct = compute_type or "float16"
-            return "cuda", cuda_device_index, ct
-    except Exception:
-        pass
-
-    # Fallback to CPU
-    return "cpu", 0, (compute_type or "int8")
-
-
-def run_smoke_test(model_size: str = "tiny") -> Dict:
-    """
-    Run a quick smoke test to verify GPU setup.
-    Returns diagnostic info.
-    """
-    result = {
+# ---------------------------------------------------------------------------
+# Smoke test (used by /api/selftest)
+# ---------------------------------------------------------------------------
+def run_smoke_test(model_size: str = "tiny") -> Dict[str, Any]:
+    """Load a small model to verify GPU setup end-to-end."""
+    result: Dict[str, Any] = {
         "success": False,
-        "device": "unknown",
-        "device_index": 0,
-        "compute_type": "unknown",
+        "device": DEVICE,
+        "device_index": DEVICE_INDEX,
+        "compute_type": COMPUTE_TYPE,
+        "model_size": model_size,
         "error": None,
-        "model_size": model_size
     }
-
     try:
-        device, device_index, compute_type = select_device()
-        result["device"] = device
-        result["device_index"] = device_index
-        result["compute_type"] = compute_type
-
-        print(f"[SMOKE TEST] Attempting to load model: {model_size}, device={device}, device_index={device_index}, compute_type={compute_type}")
-
+        print(f"[SMOKE TEST] Loading model={model_size} device={DEVICE}:{DEVICE_INDEX} compute_type={COMPUTE_TYPE}")
         _ = WhisperModel(
             model_size,
-            device=device,
-            compute_type=compute_type,
-            device_index=device_index if device == "cuda" else 0
+            device=DEVICE,
+            compute_type=COMPUTE_TYPE,
+            device_index=DEVICE_INDEX if DEVICE == "cuda" else 0,
         )
-
         result["success"] = True
-        print(f"[SMOKE TEST] SUCCESS - Model loaded on {device}:{device_index}")
-        return result
-
+        print(f"[SMOKE TEST] OK")
     except Exception as e:
         result["error"] = str(e)
-        print(f"[SMOKE TEST] FAILED - {e}")
-        return result
+        print(f"[SMOKE TEST] FAILED: {e}")
+    return result
 
 
-def get_model(model_size: str = "base", device: str = None, compute_type: str = None) -> WhisperModel:
+# ---------------------------------------------------------------------------
+# Progress helper
+# ---------------------------------------------------------------------------
+def _smooth_progress(segment_count: int) -> int:
+    """Exponential saturation: 0 segs → 10%, ~250 segs → ~78%."""
+    return min(90, max(10, int(10 + 80 * (1.0 - math.exp(-segment_count / 140.0)))))
+
+
+# ---------------------------------------------------------------------------
+# Repetition guard
+# ---------------------------------------------------------------------------
+def _suppress_repetition_loops(segments: List[Dict], max_repeats: int = 2) -> List[Dict]:
     """
-    Get or create WhisperModel instance.
-    Models are cached per size to avoid reloading.
-    Supports explicit GPU selection via env vars.
-    """
-    global _model_cache
+    Drop excess consecutive segments with identical text.
+    Catches hallucination loops common on sparse/silent Omi audio.
 
-    if model_size not in _model_cache:
-        # Use environment-based device selection if not provided
-        if device is None or compute_type is None:
-            auto_device, auto_index, auto_compute = select_device()
-            device = device or auto_device
-            compute_type = compute_type or auto_compute
-            device_index = auto_index
+    Example: ["hello", "hello", "hello", "hello"] → ["hello", "hello"]  (max_repeats=2)
+    """
+    if not segments or max_repeats < 1:
+        return segments
+    result: List[Dict] = []
+    run_text: Optional[str] = None
+    run_count = 0
+    dropped = 0
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if text == run_text:
+            run_count += 1
         else:
-            device_index = int(os.getenv("CUDA_DEVICE_INDEX", "0"))
-
-        print(f"[WHISPER] Loading model: {model_size}, device={device}, device_index={device_index}, compute_type={compute_type}")
-        diag = get_device_diagnostics()
-        try:
-            print(f"[WHISPER] nvidia-smi detected_gpus={len(diag.get('detected_gpus', []))} CUDA_VISIBLE_DEVICES={diag.get('cuda_visible_devices')}")
-        except Exception:
-            pass
-
-        model_kwargs = {
-            "device": device,
-            "compute_type": compute_type,
-        }
-        if device == "cuda":
-            model_kwargs["device_index"] = device_index
-
-        _model_cache[model_size] = WhisperModel(model_size, **model_kwargs)
-        print(f"[WHISPER] Model loaded OK on {device}:{device_index}")
-
-    return _model_cache[model_size]
+            run_text = text
+            run_count = 1
+        if run_count <= max_repeats:
+            result.append(seg)
+        else:
+            dropped += 1
+    if dropped:
+        print(f"[WHISPER] Suppressed {dropped} repeated segment(s) (hallucination loop guard)")
+    return result
 
 
-def _smooth_progress_from_segments(segment_count: int) -> int:
-    """
-    Produce a smooth progress number in [10..90] based on how many segments we've consumed,
-    without knowing total segments in advance.
-    This avoids "stuck at 69%" and looks continuous.
-    """
-    # exponential saturation curve
-    # seg=0 => 10, seg~120 => ~60, seg~250 => ~78, seg~400 => ~86
-    value = 10 + int(80 * (1.0 - math.exp(-segment_count / 140.0)))
-    return min(90, max(10, value))
-
-
+# ---------------------------------------------------------------------------
+# Transcription
+# ---------------------------------------------------------------------------
 def transcribe_audio(
     audio_path: str,
-    language: str = "en",
+    language: str = None,
+    model_size: str = None,
+    timestamps_enabled: bool = True,
+    progress_callback: Optional[Callable[[int], None]] = None,
+    # Legacy params (kept for call-site compatibility with old worker code)
     diarization_enabled: bool = False,
     speaker_count: int = 1,
-    model_size: str = "base",
-    timestamps_enabled: bool = True,
-    progress_callback: Optional[Callable[[int], None]] = None
 ) -> Tuple[str, List[Dict]]:
     """
-    Transcribe audio file and return transcript text and timestamps.
+    Transcribe audio. Returns (full_text, segments).
 
-    Returns:
-        (transcript_text, timestamps_list)
+    Each segment: {"start": float, "end": float, "text": str}
     """
     model = get_model(model_size)
 
-    # NOTE: faster-whisper uses CTranslate2 under the hood.
-    # batch_size is supported in newer versions; if not, it will error.
-    # We'll include it but fall back if needed.
-    transcribe_kwargs = {
-        "language": language if language in ["en", "ru", "fr"] else None,
+    kwargs: Dict[str, Any] = {
+        "language": language or None,
         "word_timestamps": timestamps_enabled,
-
-        # Quality vs speed knobs
-        "beam_size": 5,
-        "best_of": 5,
+        "beam_size": _BEAM_SIZE,
+        "best_of": _BEST_OF,
         "patience": 1.0,
-        "length_penalty": 1.0,
         "temperature": 0.0,
-
         "compression_ratio_threshold": 2.4,
         "log_prob_threshold": -1.0,
         "no_speech_threshold": 0.6,
-        "condition_on_previous_text": True,
-        "initial_prompt": None,
-
-        # VAD: True makes less garbage, sometimes slightly slower but often better.
+        "condition_on_previous_text": _CONDITION_ON_PREV,
         "vad_filter": True,
-        "vad_parameters": None,
-
-        # Try to increase GPU throughput
         "batch_size": 16,
     }
+    print(
+        f"[WHISPER] Settings: beam={_BEAM_SIZE} best_of={_BEST_OF} "
+        f"condition_on_prev={_CONDITION_ON_PREV} max_repeat={_MAX_REPEAT_SEGS}"
+    )
 
-    print("[TRANSCRIBE] Starting transcription...")
+    print("[WHISPER] Starting transcription...")
     if progress_callback:
         progress_callback(5)
 
-    # Run transcription (generator of segments)
     try:
-        segments, info = model.transcribe(audio_path, **transcribe_kwargs)
-    except TypeError as e:
-        # batch_size not supported in older faster-whisper -> retry without it
-        if "batch_size" in str(e):
-            transcribe_kwargs.pop("batch_size", None)
-            segments, info = model.transcribe(audio_path, **transcribe_kwargs)
-        else:
-            raise
+        segments_gen, info = model.transcribe(audio_path, **kwargs)
+    except TypeError:
+        # older faster-whisper doesn't support batch_size
+        kwargs.pop("batch_size", None)
+        segments_gen, info = model.transcribe(audio_path, **kwargs)
 
-    transcript_parts: List[str] = []
+    parts: List[str] = []
     timestamps: List[Dict] = []
-    segment_count = 0
+    n = 0
 
-    # STREAMING: process segments as they come, no huge RAM usage
-    for segment in segments:
-        segment_count += 1
-
-        text = (segment.text or "").strip()
+    for seg in segments_gen:
+        n += 1
+        text = (seg.text or "").strip()
         if text:
-            transcript_parts.append(text)
-            timestamps.append({
-                "start": round(segment.start, 2),
-                "end": round(segment.end, 2),
-                "text": text
-            })
+            parts.append(text)
+            timestamps.append({"start": round(seg.start, 2), "end": round(seg.end, 2), "text": text})
+        if progress_callback and n % 5 == 0:
+            progress_callback(_smooth_progress(n))
 
-        if progress_callback and (segment_count % 5 == 0):
-            progress_callback(_smooth_progress_from_segments(segment_count))
-
-    print(f"[TRANSCRIBE] Done. language={getattr(info, 'language', None)} prob={getattr(info, 'language_probability', 0.0):.2f} segments={segment_count}")
+    lang = getattr(info, "language", None)
+    prob = getattr(info, "language_probability", 0.0)
+    print(f"[WHISPER] Done: language={lang} prob={prob:.2f} segments={n}")
 
     if progress_callback:
         progress_callback(90)
 
-    full_transcript = " ".join(transcript_parts)
-    return full_transcript, timestamps
+    timestamps = _suppress_repetition_loops(timestamps, _MAX_REPEAT_SEGS)
+    full_text = " ".join(s["text"] for s in timestamps)
+    return full_text, timestamps
 
 
+# ---------------------------------------------------------------------------
+# Summary + analytics (post-processing, no GPU needed)
+# ---------------------------------------------------------------------------
 def generate_summary(transcript: str) -> Dict:
-    """
-    Generate a simple extractive summary (5 bullet points).
-    For a more sophisticated approach, use an LLM API.
-    """
-    sentences = re.split(r"[.!?]+", transcript)
-    sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
-
-    if len(sentences) == 0:
+    sentences = [s.strip() for s in re.split(r"[.!?]+", transcript) if len(s.strip()) > 20]
+    if not sentences:
         return {"bullets": ["No content to summarize."]}
-
-    bullets = []
     if len(sentences) >= 5:
-        indices = [0, len(sentences) // 4, len(sentences) // 2, 3 * len(sentences) // 4, -1]
-        bullets = [sentences[i] for i in indices if 0 <= i < len(sentences)]
+        idx = [0, len(sentences) // 4, len(sentences) // 2, 3 * len(sentences) // 4, -1]
+        bullets = [sentences[i] for i in idx if 0 <= i < len(sentences)]
     else:
         bullets = sentences[:5]
-
-    bullets = bullets[:5]
-    return {
-        "bullets": bullets,
-        "note": "Extractive summary - for better results, use LLM-based summarization"
-    }
+    return {"bullets": bullets[:5]}
 
 
 def generate_analytics(transcript: str, timestamps: List[Dict]) -> Dict:
-    """
-    Generate basic analytics: duration, word count, WPM, pauses, signals.
-    """
     if not timestamps:
-        return {
-            "duration": 0,
-            "word_count": 0,
-            "words_per_minute": 0,
-            "long_pauses_count": 0,
-            "signals": {}
-        }
-
-    duration = timestamps[-1]["end"] if timestamps else 0
-
-    words = transcript.split()
-    word_count = len(words)
-
-    words_per_minute = (word_count / duration * 60) if duration > 0 else 0
-
-    long_pauses = 0
-    pause_threshold = 2.0
-    for i in range(1, len(timestamps)):
-        gap = timestamps[i]["start"] - timestamps[i - 1]["end"]
-        if gap > pause_threshold:
-            long_pauses += 1
-
-    signals: Dict[str, str] = {}
-    if words_per_minute < 100:
-        signals["speaking_rate"] = "slow"
-    elif words_per_minute > 200:
-        signals["speaking_rate"] = "fast"
-    else:
-        signals["speaking_rate"] = "normal"
-
-    pause_frequency = long_pauses / duration if duration > 0 else 0
-    if pause_frequency > 0.5:
-        signals["pause_frequency"] = "high"
-    elif pause_frequency < 0.1:
-        signals["pause_frequency"] = "low"
-    else:
-        signals["pause_frequency"] = "normal"
-
-    signals["disclaimer"] = "These are heuristic signals only, not psychological analysis"
-
+        return {"duration": 0, "word_count": 0, "words_per_minute": 0, "long_pauses_count": 0}
+    duration = timestamps[-1]["end"]
+    word_count = len(transcript.split())
+    wpm = round(word_count / duration * 60, 1) if duration > 0 else 0
+    pauses = sum(
+        1 for i in range(1, len(timestamps))
+        if timestamps[i]["start"] - timestamps[i - 1]["end"] > 2.0
+    )
     return {
         "duration": round(duration, 2),
         "word_count": word_count,
-        "words_per_minute": round(words_per_minute, 1),
-        "long_pauses_count": long_pauses,
-        "signals": signals
+        "words_per_minute": wpm,
+        "long_pauses_count": pauses,
     }

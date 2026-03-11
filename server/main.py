@@ -1,114 +1,36 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+"""
+VoiceRecordTranscriptor — web service.
+
+Serves API v2 (Android/Omi client), diagnostics, and a minimal browser debug UI.
+API auth: Authorization: Bearer / X-Api-Token headers only.
+Browser UI: token stored in localStorage, never in URL.
+"""
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, FileResponse, PlainTextResponse
-from starlette.templating import Jinja2Templates
+from fastapi.responses import JSONResponse, HTMLResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 import os
 import json
-import uuid
-import shutil
+import time
 from pathlib import Path
-from typing import Optional, List, Dict
-import asyncio
-from datetime import datetime
 
-# Optional import - diarization only needed for worker, not web service
-try:
-    from diarization import group_by_speaker
-    DIARIZATION_AVAILABLE = True
-except ImportError:
-    DIARIZATION_AVAILABLE = False
+import redis as _redis_lib
 
-    def group_by_speaker(segments):
-        """Fallback when diarization module not available."""
-        return {}
+from api_v2 import router as api_v2_router
 
-
-app = FastAPI(title="Voice Transcript Server")
-
-# Authentication configuration
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 AUTH_TOKEN = os.getenv("AUTH_TOKEN")
-AUTH_QUERY_PARAM = os.getenv("AUTH_QUERY_PARAM", "token")
-
-
-def is_authorized(request: StarletteRequest) -> bool:
-    """Check if request is authorized via query param or Authorization header."""
-    if not AUTH_TOKEN:
-        return False
-    
-    # Check query parameter
-    query_token = request.query_params.get(AUTH_QUERY_PARAM)
-    if query_token == AUTH_TOKEN:
-        return True
-    
-    # Check Authorization header
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]  # Remove "Bearer " prefix
-        if token == AUTH_TOKEN:
-            return True
-    
-    return False
-
-
-class AuthMiddleware(BaseHTTPMiddleware):
-    """Middleware to enforce static token authentication."""
-
-    async def dispatch(self, request: StarletteRequest, call_next):
-        # Allow health endpoints without authentication
-        if request.url.path in ["/health", "/api/health"]:
-            return await call_next(request)
-
-        # If AUTH_TOKEN is not set, refuse all requests
-        if not AUTH_TOKEN:
-            return PlainTextResponse(
-                "500 Internal Server Error: AUTH_TOKEN not set. Server cannot run without authentication.",
-                status_code=500
-            )
-
-        # Check authorization
-        if not is_authorized(request):
-            return PlainTextResponse(
-                f"403 Forbidden. Authentication required. Add ?{AUTH_QUERY_PARAM}=YOUR_TOKEN to the URL or send Authorization: Bearer YOUR_TOKEN header.",
-                status_code=403
-            )
-
-        # Authorized, proceed
-        return await call_next(request)
-
-
-app.add_middleware(AuthMiddleware)
-
-# Redis connection for job queue
+SESSIONS_DIR = Path(os.getenv("SESSIONS_DIR", "/data/sessions"))
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_QUEUE = os.getenv("REDIS_QUEUE", "transcription_jobs")
 
-_redis_client = None
+# Paths that never require auth (public)
+_PUBLIC_PATHS = {"/", "/health", "/api/health", "/api/v2/health"}
 
-def get_redis():
-    """Get or create Redis client."""
-    global _redis_client
-    if _redis_client is None:
-        try:
-            import redis
-            _redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-            _redis_client.ping()  # Test connection
-            print(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
-        except Exception as e:
-            print(f"Warning: Could not connect to Redis: {e}")
-            print("Worker queue disabled - jobs will not be processed")
-    return _redis_client
-
-@app.on_event("startup")
-async def startup_event():
-    print("=" * 50)
-    print("Starting Voice Transcript Web Server")
-    print("=" * 50)
-    # Test Redis connection
-    get_redis()
-    print("=" * 50)
+app = FastAPI(title="VoiceRecordTranscriptor", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,985 +40,679 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Templates
-templates = Jinja2Templates(directory="templates")
 
-DATA_DIR = Path("/data")
-SESSIONS_DIR = DATA_DIR / "sessions"
-SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Auth middleware — API only (browser UI handles its own auth via JS)
+# ---------------------------------------------------------------------------
+def _is_authorized(request: StarletteRequest) -> bool:
+    if not AUTH_TOKEN:
+        return False
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and auth[7:] == AUTH_TOKEN:
+        return True
+    if request.headers.get("X-Api-Token", "") == AUTH_TOKEN:
+        return True
+    return False
 
 
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        path = request.url.path
+        # Public: root UI page and health checks
+        if path in _PUBLIC_PATHS or path.startswith("/api/v2/health"):
+            return await call_next(request)
+        # API calls require header auth
+        if path.startswith("/api/"):
+            if not _is_authorized(request):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Authentication required. Use 'Authorization: Bearer <token>' header."},
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        return await call_next(request)
+
+
+app.add_middleware(AuthMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+@app.on_event("startup")
+async def startup_event():
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        r = _redis_lib.Redis(host=REDIS_HOST, port=REDIS_PORT)
+        r.ping()
+        print(f"[STARTUP] Redis OK at {REDIS_HOST}:{REDIS_PORT}")
+    except Exception as e:
+        print(f"[STARTUP] Redis not available: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+@app.get("/health")
 @app.get("/api/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "service": "web"}
+
+
+# ---------------------------------------------------------------------------
+# Sessions list (for browser UI)
+# ---------------------------------------------------------------------------
+@app.get("/api/sessions")
+async def list_sessions():
+    """List recent sessions, newest first. Max 100."""
+    sessions = []
+    if not SESSIONS_DIR.exists():
+        return {"sessions": []}
+    for d in sorted(SESSIONS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[:100]:
+        if not d.is_dir():
+            continue
+        entry = {"session_id": d.name, "is_v2": (d / "v2_session.json").exists()}
+        # Read status
+        sp = d / "status.json"
+        if sp.exists():
+            try:
+                s = json.loads(sp.read_text(encoding="utf-8"))
+                entry["status"] = s.get("status", "unknown")
+                entry["updated_at"] = s.get("updated_at")
+                entry["progress"] = s.get("progress", {})
+            except Exception:
+                entry["status"] = "unreadable"
+        # Read creation time from v2_session.json or mtime
+        vsp = d / "v2_session.json"
+        if vsp.exists():
+            try:
+                v = json.loads(vsp.read_text(encoding="utf-8"))
+                entry["created_at"] = v.get("created_at")
+                entry["device_id"] = v.get("device_id")
+                entry["mode"] = v.get("mode")
+            except Exception:
+                pass
+        if "created_at" not in entry:
+            entry["created_at"] = time.strftime(
+                "%Y-%m-%dT%H:%M:%S", time.localtime(d.stat().st_mtime)
+            )
+        sessions.append(entry)
+    return {"sessions": sessions}
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+@app.get("/api/diagnostics")
+async def diagnostics():
+    result = {"redis": {"ok": False, "error": None}, "sessions_dir": str(SESSIONS_DIR), "gpu": {}}
+    try:
+        r = _redis_lib.Redis(host=REDIS_HOST, port=REDIS_PORT)
+        r.ping()
+        result["redis"]["ok"] = True
+        result["redis"]["queue_len"] = r.llen(os.getenv("REDIS_QUEUE", "transcription_jobs"))
+    except Exception as e:
+        result["redis"]["error"] = str(e)
+    try:
+        from transcription import get_device_diagnostics  # type: ignore
+        result["gpu"] = get_device_diagnostics()
+    except ImportError:
+        result["gpu"] = {"note": "transcription module not in web container"}
+    except Exception as e:
+        result["gpu"] = {"error": str(e)}
+    return result
 
 
 @app.get("/api/selftest")
 async def selftest():
-    """Quick selftest - verify GPU/device configuration without full transcription."""
-    import subprocess
-    from transcription import get_device_diagnostics, select_device
-
-    device, device_index, compute_type = select_device()
-
-    result = {
-        "device_selected": device,
-        "device_index": device_index,
-        "compute_type": compute_type,
-        "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
-        "force_device": os.getenv("FORCE_DEVICE"),
-        "nvidia_smi_present": False,
-        "nvidia_smi_output": ""
-    }
-
-    # Quick nvidia-smi check
     try:
-        smi_result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,name,utilization.gpu", "--format=csv,noheader"],
-            capture_output=True,
-            timeout=2,
-            text=True
-        )
-        if smi_result.returncode == 0:
-            result["nvidia_smi_present"] = True
-            result["nvidia_smi_output"] = smi_result.stdout.strip()
+        from transcription import run_smoke_test  # type: ignore
+        result = run_smoke_test(model_size="tiny")
+        return {"ok": result.get("success", False), "details": result}
+    except ImportError:
+        return {"ok": False, "details": "transcription module not in web container"}
     except Exception as e:
-        result["nvidia_smi_error"] = str(e)
-
-    return result
+        return {"ok": False, "details": str(e)}
 
 
-@app.get("/api/diagnostics")
-async def diagnostics():
-    """Full diagnostics: device info, GPU info, env, queue stats, errors."""
-    from transcription import get_device_diagnostics, run_smoke_test, select_device
-
-    device, device_index, compute_type = select_device()
-
-    # Get Redis stats
-    redis_stats = {"connected": False, "queue_length": 0}
-    r = get_redis()
-    if r:
-        try:
-            redis_stats["connected"] = True
-            redis_stats["queue_length"] = r.llen(REDIS_QUEUE)
-        except Exception as e:
-            redis_stats["error"] = str(e)
-
-    # Get session stats
-    session_stats = {
-        "total": 0,
-        "uploaded": 0,
-        "processing": 0,
-        "running": 0,
-        "done": 0,
-        "error": 0,
-        "cancelled": 0
-    }
-    if SESSIONS_DIR.exists():
-        for session_dir in SESSIONS_DIR.iterdir():
-            if session_dir.is_dir():
-                status_path = session_dir / "status.json"
-                if status_path.exists():
-                    session_stats["total"] += 1
-                    try:
-                        with open(status_path, "r") as f:
-                            status_data = json.load(f)
-                            status = status_data.get("status", "unknown")
-                            session_stats[status] = session_stats.get(status, 0) + 1
-                    except:
-                        pass
-
-    # Run quick smoke test (tiny model)
-    smoke_result = run_smoke_test("tiny")
-
-    return {
-        "device_info": {
-            "selected_device": device,
-            "device_index": device_index,
-            "compute_type": compute_type
-        },
-        "env_vars": {
-            "FORCE_DEVICE": os.getenv("FORCE_DEVICE"),
-            "CUDA_DEVICE_INDEX": os.getenv("CUDA_DEVICE_INDEX"),
-            "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES"),
-            "COMPUTE_TYPE": os.getenv("COMPUTE_TYPE"),
-            "MAX_UPLOAD_MB": os.getenv("MAX_UPLOAD_MB", "200"),
-            "MAX_QUEUE": os.getenv("MAX_QUEUE", "20"),
-            "MAX_WORKERS": os.getenv("MAX_WORKERS", "1")
-        },
-        "gpu_diagnostics": get_device_diagnostics(),
-        "smoke_test": smoke_result,
-        "redis_stats": redis_stats,
-        "session_stats": session_stats
-    }
-
-
-@app.get("/api/jobs")
-async def list_jobs():
-    """List all jobs (sessions) with their current status."""
-    jobs = []
-    if SESSIONS_DIR.exists():
-        for session_dir in SESSIONS_DIR.iterdir():
-            if session_dir.is_dir():
-                status_path = session_dir / "status.json"
-                metadata_path = session_dir / "metadata.json"
-                if status_path.exists():
-                    with open(status_path, "r") as f:
-                        status_data = json.load(f)
-
-                    metadata = {}
-                    if metadata_path.exists():
-                        with open(metadata_path, "r") as f:
-                            metadata = json.load(f)
-
-                    jobs.append({
-                        "job_id": session_dir.name,
-                        "session_id": session_dir.name,
-                        "status": status_data.get("status", "unknown"),
-                        "progress": status_data.get("progress", {}),
-                        "created_at": metadata.get("created_at", status_data.get("created_at", "")),
-                        "error": status_data.get("error")
-                    })
-
-    # Sort by created_at descending
-    jobs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return {"jobs": jobs}
-
-
-@app.get("/api/jobs/{job_id}")
-async def get_job_status(job_id: str):
-    """Get status of a specific job."""
-    session_dir = SESSIONS_DIR / job_id
-    if not session_dir.exists():
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    status_path = session_dir / "status.json"
-    if not status_path.exists():
-        raise HTTPException(status_code=404, detail="Job status not found")
-
-    with open(status_path, "r") as f:
-        status_data = json.load(f)
-
-    metadata = {}
-    metadata_path = session_dir / "metadata.json"
-    if metadata_path.exists():
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-
-    return {
-        "job_id": job_id,
-        "session_id": job_id,
-        "status": status_data.get("status", "unknown"),
-        "progress": status_data.get("progress", {}),
-        "error": status_data.get("error"),
-        "metadata": metadata
-    }
-
-
-@app.post("/api/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str):
-    """Cancel a job (best effort - only works if not yet started)."""
-    return await cancel_transcription(job_id)
-
-
+# ---------------------------------------------------------------------------
+# Browser debug UI — single-page app, token in localStorage
+# ---------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    context = {
-        "request": request,
-        "auth_token": AUTH_TOKEN,
-        "auth_query_param": AUTH_QUERY_PARAM,
+async def ui():
+    return HTMLResponse(_UI_HTML)
+
+
+_UI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VoiceTranscript</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui, sans-serif; font-size: 14px; background: #0f1117; color: #e0e0e0; min-height: 100vh; }
+a { color: #7eb6ff; }
+.page { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+h1 { font-size: 18px; font-weight: 600; color: #fff; }
+
+/* token gate */
+#gate { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 60vh; gap: 12px; }
+#gate h2 { font-size: 16px; color: #aaa; }
+#gate input { width: 320px; padding: 10px 14px; border-radius: 6px; border: 1px solid #333; background: #1a1d27; color: #fff; font-size: 14px; outline: none; }
+#gate input:focus { border-color: #4a7eff; }
+#gate .btn-primary { padding: 10px 28px; border-radius: 6px; border: none; background: #4a7eff; color: #fff; cursor: pointer; font-size: 14px; }
+#gate .btn-primary:hover { background: #3a6eff; }
+
+/* top bar */
+#topbar { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; padding-bottom: 14px; border-bottom: 1px solid #222; flex-wrap: wrap; }
+#topbar h1 { flex: 1; }
+.pill { padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 500; white-space: nowrap; }
+.pill.ok { background: #1a3a1a; color: #4caf50; }
+.pill.err { background: #3a1a1a; color: #f44336; }
+.pill.unknown { background: #2a2a2a; color: #888; }
+
+/* buttons */
+.btn { padding: 6px 14px; border-radius: 5px; border: 1px solid #333; background: #1e2130; color: #ccc; cursor: pointer; font-size: 13px; white-space: nowrap; }
+.btn:hover { background: #2a2f45; color: #fff; }
+.btn.primary { background: #1a3a6a; border-color: #2a5aaa; color: #7eb6ff; }
+.btn.primary:hover { background: #1e4a8a; }
+.btn.danger { border-color: #552222; color: #f88; }
+.btn.danger:hover { background: #3a1a1a; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* two-column layout */
+.layout { display: grid; grid-template-columns: 340px 1fr; gap: 20px; align-items: start; }
+@media (max-width: 700px) { .layout { grid-template-columns: 1fr; } }
+
+/* upload card */
+.card { background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 8px; padding: 16px; }
+.card h2 { font-size: 13px; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 14px; }
+.form-row { margin-bottom: 12px; }
+.form-row label { display: block; font-size: 12px; color: #777; margin-bottom: 4px; }
+.form-row select, .form-row input[type=number] {
+  width: 100%; padding: 7px 10px; border-radius: 5px; border: 1px solid #333;
+  background: #0f1117; color: #ddd; font-size: 13px; outline: none;
+}
+.form-row select:focus, .form-row input:focus { border-color: #4a7eff; }
+.drop-zone {
+  border: 2px dashed #333; border-radius: 6px; padding: 24px 12px;
+  text-align: center; color: #555; cursor: pointer; transition: border-color .15s, color .15s;
+  margin-bottom: 12px;
+}
+.drop-zone.hover, .drop-zone.has-file { border-color: #4a7eff; color: #7eb6ff; }
+.drop-zone.has-file { background: #0d1520; }
+#upload-progress { margin-top: 10px; font-size: 12px; color: #888; min-height: 18px; }
+#upload-progress .prog-bar { height: 4px; background: #222; border-radius: 2px; margin-top: 6px; }
+#upload-progress .prog-fill { height: 100%; background: #4a7eff; border-radius: 2px; transition: width .3s; }
+
+/* sessions panel */
+.toolbar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.toolbar input { flex: 1; min-width: 160px; padding: 7px 12px; border-radius: 5px; border: 1px solid #333; background: #1a1d27; color: #fff; font-size: 13px; outline: none; }
+.toolbar input:focus { border-color: #4a7eff; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; padding: 7px 10px; border-bottom: 1px solid #222; color: #555; font-weight: 500; font-size: 12px; }
+td { padding: 7px 10px; border-bottom: 1px solid #181b24; vertical-align: middle; }
+.status-done { color: #4caf50; }
+.status-running, .status-queued { color: #ffa726; }
+.status-error { color: #f44336; }
+.clickable { cursor: pointer; color: #7eb6ff; font-family: monospace; font-size: 12px; }
+.clickable:hover { text-decoration: underline; }
+
+/* detail panel */
+#detail { margin-top: 16px; background: #1a1d27; border-radius: 8px; border: 1px solid #2a2d3a; padding: 16px; display: none; }
+#detail h3 { font-size: 13px; font-weight: 600; color: #aaa; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+pre { background: #0f1117; border-radius: 5px; padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; color: #ccc; border: 1px solid #222; max-height: 360px; overflow-y: auto; }
+.section-title { font-size: 11px; color: #555; margin: 14px 0 4px; text-transform: uppercase; letter-spacing: 0.06em; }
+.actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.transcript-text { background: #0f1117; border-radius: 5px; padding: 12px; font-size: 13px; line-height: 1.7; color: #ddd; border: 1px solid #222; max-height: 280px; overflow-y: auto; }
+
+/* message bar */
+#msg { padding: 8px 12px; border-radius: 5px; font-size: 13px; margin-bottom: 12px; display: none; }
+#msg.info { background: #1a2a3a; color: #7eb6ff; border: 1px solid #2a3a4a; }
+#msg.err { background: #2a1a1a; color: #f88; border: 1px solid #4a2a2a; }
+#msg.ok { background: #1a2a1a; color: #7ecf7e; border: 1px solid #2a4a2a; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- TOKEN GATE -->
+<div id="gate">
+  <h2>VoiceTranscript</h2>
+  <p style="color:#555;font-size:12px;margin-bottom:4px">Enter your API token to continue</p>
+  <input type="password" id="token-input" placeholder="Paste token here..." autocomplete="off">
+  <button class="btn-primary" onclick="saveToken()">Connect</button>
+</div>
+
+<!-- DASHBOARD -->
+<div id="dashboard" style="display:none">
+  <div id="topbar">
+    <h1>VoiceTranscript</h1>
+    <span id="gpu-pill" class="pill unknown">GPU …</span>
+    <span id="redis-pill" class="pill unknown">Redis …</span>
+    <button class="btn" onclick="refreshAll()">↻ Refresh</button>
+    <button class="btn danger" onclick="clearToken()">Sign out</button>
+  </div>
+
+  <div id="msg"></div>
+
+  <div class="layout">
+
+    <!-- LEFT: upload + options -->
+    <div>
+      <div class="card">
+        <h2>New Transcription</h2>
+
+        <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+          <div id="drop-label">Click or drag an audio file here</div>
+          <div style="font-size:11px;color:#444;margin-top:4px">WAV, MP3, M4A, OGG, FLAC, …</div>
+        </div>
+        <input type="file" id="file-input" accept="audio/*,video/*" style="display:none" onchange="onFileSelected(this)">
+
+        <div class="form-row">
+          <label>Language</label>
+          <select id="opt-lang">
+            <option value="">Auto-detect</option>
+            <option value="en">English</option>
+            <option value="ru">Russian</option>
+            <option value="de">German</option>
+            <option value="fr">French</option>
+            <option value="es">Spanish</option>
+            <option value="zh">Chinese</option>
+            <option value="ja">Japanese</option>
+            <option value="ar">Arabic</option>
+            <option value="pt">Portuguese</option>
+            <option value="it">Italian</option>
+            <option value="ko">Korean</option>
+            <option value="tr">Turkish</option>
+            <option value="pl">Polish</option>
+            <option value="uk">Ukrainian</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <label>Whisper model</label>
+          <select id="opt-model">
+            <option value="tiny">tiny — fastest, least accurate</option>
+            <option value="base">base</option>
+            <option value="small" selected>small — recommended</option>
+            <option value="medium">medium — slower, more accurate</option>
+            <option value="large-v2">large-v2 — best quality</option>
+            <option value="large-v3">large-v3</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <label>Speakers (diarization)</label>
+          <select id="opt-speakers">
+            <option value="0">Auto-detect</option>
+            <option value="1">1 speaker</option>
+            <option value="2" selected>2 speakers</option>
+            <option value="3">3 speakers</option>
+            <option value="4">4 speakers</option>
+            <option value="5">5 speakers</option>
+            <option value="6">6+ speakers</option>
+          </select>
+        </div>
+
+        <div id="upload-progress"></div>
+        <button class="btn primary" id="submit-btn" onclick="submitUpload()" style="width:100%;margin-top:4px" disabled>
+          Upload &amp; Transcribe
+        </button>
+      </div>
+    </div>
+
+    <!-- RIGHT: sessions list + detail -->
+    <div>
+      <div class="toolbar">
+        <input id="lookup-id" placeholder="Session / job ID…" onkeydown="if(event.key==='Enter')lookupSession()">
+        <button class="btn" onclick="lookupSession()">Look up</button>
+        <button class="btn" onclick="loadSessions()">↻ Sessions</button>
+      </div>
+
+      <table id="sessions-table">
+        <thead><tr>
+          <th>Session ID</th>
+          <th>Status</th>
+          <th>Model</th>
+          <th>Created</th>
+        </tr></thead>
+        <tbody id="sessions-body"></tbody>
+      </table>
+
+      <div id="detail">
+        <h3 id="detail-title">Session detail</h3>
+        <div id="detail-body"></div>
+      </div>
+    </div>
+
+  </div><!-- .layout -->
+</div><!-- #dashboard -->
+
+</div><!-- .page -->
+
+<script>
+const BASE = '';
+let _selectedFile = null;
+let _pollTimer = null;
+
+// ── Auth ──────────────────────────────────────────────────────────────
+function getToken() { return localStorage.getItem('vts_token') || ''; }
+
+function saveToken() {
+  const t = document.getElementById('token-input').value.trim();
+  if (!t) return;
+  localStorage.setItem('vts_token', t);
+  showDashboard();
+}
+
+function clearToken() {
+  localStorage.removeItem('vts_token');
+  document.getElementById('dashboard').style.display = 'none';
+  document.getElementById('gate').style.display = 'flex';
+  document.getElementById('token-input').value = '';
+}
+
+function showDashboard() {
+  document.getElementById('gate').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'block';
+  refreshAll();
+}
+
+// ── HTTP helpers ──────────────────────────────────────────────────────
+async function apiFetch(path, opts = {}) {
+  const headers = { 'Authorization': 'Bearer ' + getToken(), ...(opts.headers || {}) };
+  if (!(opts.body instanceof FormData) && !headers['Content-Type']) {
+    headers['Content-Type'] = 'application/json';
+  }
+  const res = await fetch(BASE + path, { ...opts, headers });
+  if (res.status === 401 || res.status === 403) {
+    showMsg('Token rejected — check your token.', 'err');
+    return null;
+  }
+  return res;
+}
+
+function showMsg(text, type = 'info') {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = type;
+  el.style.display = 'block';
+  if (type !== 'err') setTimeout(() => { el.style.display = 'none'; }, 7000);
+}
+
+// ── Health / status bar ───────────────────────────────────────────────
+async function refreshAll() { loadHealth(); loadSessions(); }
+
+async function loadHealth() {
+  try {
+    const res = await fetch(BASE + '/api/v2/health');
+    const d = await res.json();
+    const gp = document.getElementById('gpu-pill');
+    gp.textContent = d.gpu_available ? ('GPU ✓ ' + d.selected_compute_type) : 'GPU ✗';
+    gp.className = 'pill ' + (d.gpu_available ? 'ok' : 'err');
+
+    const dr = await apiFetch('/api/diagnostics');
+    if (dr) {
+      const dd = await dr.json();
+      const rp = document.getElementById('redis-pill');
+      const ok = dd.redis && dd.redis.ok;
+      rp.textContent = ok ? ('Redis ✓ q:' + (dd.redis.queue_len ?? '?')) : 'Redis ✗';
+      rp.className = 'pill ' + (ok ? 'ok' : 'err');
     }
-    return templates.TemplateResponse("index.html", context)
+  } catch(e) { console.error('health', e); }
+}
 
+// ── Sessions list ─────────────────────────────────────────────────────
+async function loadSessions() {
+  const res = await apiFetch('/api/sessions');
+  if (!res) return;
+  const d = await res.json();
+  const tbody = document.getElementById('sessions-body');
+  tbody.innerHTML = '';
+  for (const s of (d.sessions || [])) {
+    const cls = {done:'status-done',error:'status-error',running:'status-running',queued:'status-queued'}[s.status] || '';
+    const tr = document.createElement('tr');
+    const model = s.progress && s.progress.model ? s.progress.model : (s.mode || '—');
+    tr.innerHTML = `
+      <td><span class="clickable" onclick="openSession('${s.session_id}')" title="${s.session_id}">${s.session_id.slice(0,8)}…</span></td>
+      <td class="${cls}">${s.status || '—'}</td>
+      <td style="color:#666;font-size:12px">${model}</td>
+      <td style="color:#555;font-size:12px">${(s.created_at||'').replace('T',' ').slice(0,16)}</td>`;
+    tbody.appendChild(tr);
+  }
+  if (!d.sessions || !d.sessions.length) {
+    tbody.innerHTML = '<tr><td colspan="4" style="color:#444;text-align:center;padding:24px">No sessions yet</td></tr>';
+  }
+}
 
-@app.get("/sessions", response_class=HTMLResponse)
-async def sessions_list(request: Request):
-    sessions = []
-    if SESSIONS_DIR.exists():
-        for session_dir in SESSIONS_DIR.iterdir():
-            if session_dir.is_dir():
-                status_path = session_dir / "status.json"
-                metadata_path = session_dir / "metadata.json"
-                if status_path.exists():
-                    with open(status_path, "r") as f:
-                        status_data = json.load(f)
-                    metadata = {}
-                    if metadata_path.exists():
-                        with open(metadata_path, "r") as f:
-                            metadata = json.load(f)
-                    
-                    analytics_path = session_dir / "analytics.json"
-                    duration = 0
-                    if analytics_path.exists():
-                        with open(analytics_path, "r") as f:
-                            analytics = json.load(f)
-                            duration = analytics.get("duration", 0)
-                    
-                    sessions.append({
-                        "session_id": session_dir.name,
-                        "status": status_data.get("status", "unknown"),
-                        "created_at": metadata.get("created_at", status_data.get("created_at", "")),
-                        "duration": duration
-                    })
-    
-    sessions.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    context = {
-        "request": request,
-        "sessions": sessions,
-        "auth_token": AUTH_TOKEN,
-        "auth_query_param": AUTH_QUERY_PARAM,
-    }
-    return templates.TemplateResponse("sessions.html", context)
+// ── Drag & drop / file select ─────────────────────────────────────────
+function onFileSelected(input) {
+  if (input.files && input.files[0]) setFile(input.files[0]);
+}
 
+function setFile(file) {
+  _selectedFile = file;
+  const dz = document.getElementById('drop-zone');
+  dz.classList.add('has-file');
+  document.getElementById('drop-label').textContent = file.name + ' (' + (file.size/1048576).toFixed(1) + ' MB)';
+  document.getElementById('submit-btn').disabled = false;
+}
 
-@app.get("/session/{session_id}", response_class=HTMLResponse)
-async def session_detail(request: Request, session_id: str):
-    session_dir = SESSIONS_DIR / session_id
-    if not session_dir.exists():
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Load status
-    status_path = session_dir / "status.json"
-    if not status_path.exists():
-        raise HTTPException(status_code=404, detail="Status not found")
-    
-    with open(status_path, "r") as f:
-        status_data = json.load(f)
-    
-    # Load metadata
-    metadata = {}
-    metadata_path = session_dir / "metadata.json"
-    if metadata_path.exists():
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-    
-    # Load results if done
-    transcript = ""
-    timestamps = []
-    summary = {}
-    analytics = {}
-    transcript_by_speaker = []
-    speaker_groups = {}
-    
-    if status_data.get("status") == "done":
-        transcript_path = session_dir / "transcript.txt"
-        if transcript_path.exists():
-            transcript = transcript_path.read_text(encoding="utf-8")
-        
-        timestamps_path = session_dir / "transcript_timestamps.json"
-        if timestamps_path.exists():
-            with open(timestamps_path, "r", encoding="utf-8") as f:
-                timestamps = json.load(f)
-        
-        # Load speaker-attributed transcript
-        transcript_by_speaker_path = session_dir / "transcript_by_speaker.json"
-        if transcript_by_speaker_path.exists():
-            with open(transcript_by_speaker_path, "r", encoding="utf-8") as f:
-                transcript_by_speaker = json.load(f)
-                speaker_groups = group_by_speaker(transcript_by_speaker)
-        
-        summary_path = session_dir / "summary.json"
-        if summary_path.exists():
-            with open(summary_path, "r", encoding="utf-8") as f:
-                summary = json.load(f)
-        
-        analytics_path = session_dir / "analytics.json"
-        if analytics_path.exists():
-            with open(analytics_path, "r", encoding="utf-8") as f:
-                analytics = json.load(f)
-    
-    # Get progress data
-    progress = status_data.get("progress", {
-        "upload": 100,
-        "processing": 0,
-        "stage": "starting"
-    })
+(function initDrop() {
+  const dz = document.getElementById('drop-zone');
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('hover'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('hover'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('hover');
+    const f = e.dataTransfer.files[0];
+    if (f) setFile(f);
+  });
+})();
 
-    context = {
-        "request": request,
-        "session_id": session_id,
-        "status": status_data.get("status"),
-        "progress": progress,
-        "metadata": metadata,
-        "transcript": transcript,
-        "timestamps": timestamps,
-        "transcript_by_speaker": transcript_by_speaker,
-        "speaker_groups": speaker_groups,
-        "summary": summary,
-        "analytics": analytics,
-        "auth_token": AUTH_TOKEN,
-        "auth_query_param": AUTH_QUERY_PARAM,
-    }
-    return templates.TemplateResponse("session_detail.html", context)
+// ── Upload & transcribe ───────────────────────────────────────────────
+async function submitUpload() {
+  if (!_selectedFile) return;
+  const lang = document.getElementById('opt-lang').value;
+  const model = document.getElementById('opt-model').value;
+  const numSpk = parseInt(document.getElementById('opt-speakers').value, 10);
 
+  const btn = document.getElementById('submit-btn');
+  btn.disabled = true;
+  setProgress('Creating session…', 0);
 
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "200"))
-MAX_QUEUE = int(os.getenv("MAX_QUEUE", "20"))
+  try {
+    // 1. Create session
+    const sr = await apiFetch('/api/v2/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ mode: 'upload' }),
+    });
+    if (!sr || !sr.ok) { setProgress('Failed to create session.'); btn.disabled = false; return; }
+    const { session_id } = await sr.json();
 
-@app.post("/api/upload")
-async def upload(
-    audio: UploadFile = File(...),
-    metadata: Optional[str] = Form(None),
-    language: Optional[str] = Form("en"),
-    speaker_count: Optional[int] = Form(1),
-    model_size: Optional[str] = Form("base"),
-    timestamps: Optional[bool] = Form(True)
-):
-    try:
-        # Check queue size limit
-        r = get_redis()
-        if r:
-            try:
-                queue_len = r.llen(REDIS_QUEUE)
-                if queue_len >= MAX_QUEUE:
-                    raise HTTPException(status_code=429, detail=f"Queue full ({queue_len}/{MAX_QUEUE}). Please wait.")
-            except Exception as e:
-                print(f"Warning: Could not check queue length: {e}")
-
-        # Handle both API (JSON metadata) and web UI (form fields)
-        if metadata:
-            metadata_dict = json.loads(metadata)
-            session_id = metadata_dict.get("session_id") or str(uuid.uuid4())
-            language = metadata_dict.get("language", language)
-            speaker_count = metadata_dict.get("speaker_count", speaker_count)
-            model_size = metadata_dict.get("model_size", model_size)
-            timestamps = metadata_dict.get("timestamps", timestamps)
-        else:
-            # Web UI form submission
-            session_id = str(uuid.uuid4())
-            metadata_dict = {
-                "session_id": session_id,
-                "language": language,
-                "speaker_count": speaker_count,
-                "model_size": model_size,
-                "timestamps": timestamps,
-                "created_at": datetime.now().isoformat()
-            }
-
-        session_dir = SESSIONS_DIR / session_id
-
-        # IDEMPOTENCY CHECK: If session already exists and is processed, return existing
-        if session_dir.exists():
-            status_path = session_dir / "status.json"
-            if status_path.exists():
-                with open(status_path, "r") as f:
-                    existing = json.load(f)
-                existing_status = existing.get("status")
-                if existing_status in ["uploaded", "processing", "running", "done"]:
-                    return {
-                        "session_id": session_id,
-                        "status": "already_exists",
-                        "existing_status": existing_status
-                    }
-
-        session_dir.mkdir(exist_ok=True)
-
-        # Store original filename
-        original_filename = audio.filename or "audio.wav"
-        metadata_dict["original_filename"] = original_filename
-
-        # Save audio file with streaming (avoid buffering entire file in RAM)
-        audio_path = session_dir / "audio.wav"
-        bytes_written = 0
-        max_bytes = MAX_UPLOAD_MB * 1024 * 1024
-
-        with open(audio_path, "wb") as f:
-            while chunk := await audio.read(8192):
-                bytes_written += len(chunk)
-                if bytes_written > max_bytes:
-                    # Clean up partial file
-                    f.close()
-                    audio_path.unlink(missing_ok=True)
-                    raise HTTPException(status_code=413, detail=f"File too large (max {MAX_UPLOAD_MB}MB)")
-                f.write(chunk)
-
-        print(f"[{session_id}] Upload complete: {bytes_written} bytes")
-
-        # Save metadata
-        metadata_path = session_dir / "metadata.json"
-        if "uploaded_at" not in metadata_dict:
-            metadata_dict["uploaded_at"] = datetime.now().isoformat()
-        if "created_at" not in metadata_dict:
-            metadata_dict["created_at"] = datetime.now().isoformat()
-        with open(metadata_path, "w") as f:
-            json.dump(metadata_dict, f, indent=2)
-
-        # Initialize session status with progress
-        status_path = session_dir / "status.json"
-        with open(status_path, "w") as f:
-            json.dump({
-                "status": "uploaded",
-                "session_id": session_id,
-                "progress": {
-                    "upload": 100,
-                    "processing": 0,
-                    "stage": "uploaded"
-                }
-            }, f)
-
-        # Automatically enqueue transcription job to Redis
-        if r:
-            job_data = {
-                "session_id": session_id,
-                "language": language,
-                "speaker_count": speaker_count,
-                "model_size": model_size,
-                "timestamps": timestamps
-            }
-            try:
-                r.rpush(REDIS_QUEUE, json.dumps(job_data))
-                print(f"[{session_id}] Job enqueued to Redis")
-            except Exception as e:
-                print(f"[{session_id}] Failed to enqueue job: {e}")
-        else:
-            print(f"[{session_id}] Warning: Redis not available, job not enqueued")
-
-        return {"session_id": session_id, "status": "uploaded", "progress": {"upload": 100, "processing": 0}}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# Store active transcription tasks for cancellation
-_active_tasks = {}
-
-@app.post("/api/transcribe/{session_id}")
-async def transcribe(session_id: str):
-    session_dir = SESSIONS_DIR / session_id
-    if not session_dir.exists():
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    audio_path = session_dir / "audio.wav"
-    if not audio_path.exists():
-        raise HTTPException(status_code=404, detail="Audio file not found")
-    
-    metadata_path = session_dir / "metadata.json"
-    metadata = {}
-    if metadata_path.exists():
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-    
-    language = metadata.get("language", "en")
-    diarization_enabled = metadata.get("diarization_enabled", False)
-    speaker_count = metadata.get("speaker_count", 1)
-    model_size = metadata.get("model_size", "base")
-    timestamps_enabled = metadata.get("timestamps", True)
-    
-    # Update status to processing with progress
-    status_path = session_dir / "status.json"
-    with open(status_path, "w") as f:
-        json.dump({
-            "status": "processing",
-            "session_id": session_id,
-            "progress": {
-                "upload": 100,
-                "processing": 0,
-                "stage": "starting"
-            }
-        }, f)
-    
-    print(f"[{session_id}] Starting transcription: Upload 100%, Processing 0%")
-    
-    # Run transcription in background and store task for cancellation
-    task = asyncio.create_task(process_transcription(
-        session_id, audio_path, language, diarization_enabled, speaker_count, model_size, timestamps_enabled
-    ))
-    _active_tasks[session_id] = task
-    
-    # Clean up task when done
-    task.add_done_callback(lambda t: _active_tasks.pop(session_id, None))
-    
-    return {"session_id": session_id, "status": "processing", "progress": {"upload": 100, "processing": 0}}
-
-
-def update_progress(session_id: str, stage: str, processing_percent: int):
-    """Update progress in status.json and log it"""
-    session_dir = SESSIONS_DIR / session_id
-    status_path = session_dir / "status.json"
-    
-    try:
-        with open(status_path, "r") as f:
-            status_data = json.load(f)
-        
-        status_data["progress"] = {
-            "upload": 100,
-            "processing": processing_percent,
-            "stage": stage
-        }
-        
-        with open(status_path, "w") as f:
-            json.dump(status_data, f)
-        
-        print(f"[{session_id}] Progress: Upload 100%, Processing {processing_percent}% - {stage}")
-    except Exception as e:
-        print(f"[{session_id}] Error updating progress: {e}")
-
-
-# NOTE: process_transcription moved to worker.py
-# This function is kept for backward compatibility but should not be called
-async def process_transcription(
-    session_id: str,
-    audio_path: Path,
-    language: str,
-    diarization_enabled: bool,
-    speaker_count: int,
-    model_size: str = "base",
-    timestamps_enabled: bool = True
-):
-    """DEPRECATED: Transcription is now handled by worker service."""
-    raise HTTPException(status_code=501, detail="Transcription moved to worker service")
-    try:
-        session_dir = SESSIONS_DIR / session_id
-        
-        # Load metadata for original filename
-        metadata_path = session_dir / "metadata.json"
-        metadata = {}
-        if metadata_path.exists():
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
-        
-        update_progress(session_id, "loading_model", 10)
-        
-        # Optional audio preprocessing for diarization
-        processed_audio_path = audio_path
-        if diarization_enabled and speaker_count > 1:
-            processed_audio_path = session_dir / "audio_processed.wav"
-            update_progress(session_id, "preprocessing", 5)
-            if not preprocess_audio(str(audio_path), str(processed_audio_path)):
-                # If preprocessing fails, use original
-                processed_audio_path = audio_path
-        
-        # Perform diarization if enabled
-        diarization_segments = []
-        if diarization_enabled and speaker_count > 1:
-            update_progress(session_id, "diarizing", 8)
-            try:
-                diarization_segments = perform_diarization(
-                    str(processed_audio_path),
-                    num_speakers=speaker_count,
-                    min_speakers=1,
-                    max_speakers=speaker_count
-                )
-                # Save diarization results
-                diarization_path = session_dir / "diarization.json"
-                with open(diarization_path, "w", encoding="utf-8") as f:
-                    json.dump(diarization_segments, f, indent=2)
-                print(f"[{session_id}] Diarization found {len(diarization_segments)} segments")
-            except Exception as e:
-                print(f"[{session_id}] Diarization failed: {e}, continuing without diarization")
-                diarization_segments = []
-        
-        # Check cancellation before transcription
-        if session_id in _active_tasks:
-            task = _active_tasks.get(session_id)
-            if task and task.cancelled():
-                print(f"[{session_id}] Task cancelled before transcription")
-                return
-        
-        # Transcribe
-        transcript, timestamps = transcribe_audio(
-            str(audio_path),
-            language=language,
-            diarization_enabled=diarization_enabled,
-            speaker_count=speaker_count,
-            model_size=model_size,
-            timestamps_enabled=timestamps_enabled,
-            progress_callback=lambda p: update_progress(session_id, "transcribing", 10 + int(p * 0.6))
-        )
-        
-        update_progress(session_id, "aligning", 75)
-        
-        # Align diarization with transcript
-        aligned_segments = []
-        if diarization_segments and timestamps:
-            aligned_segments = align_diarization_with_transcript(diarization_segments, timestamps)
-        elif timestamps:
-            # No diarization, use default speaker
-            aligned_segments = [
-                {**seg, "speaker": "SPEAKER_00"}
-                for seg in timestamps
-            ]
-        
-        # Group by speaker
-        speaker_groups = group_by_speaker(aligned_segments) if aligned_segments else {}
-        
-        update_progress(session_id, "saving_results", 80)
-        
-        # Save transcript (original format)
-        transcript_path = session_dir / "transcript.txt"
-        transcript_path.write_text(transcript, encoding="utf-8")
-        
-        # Save timestamps
-        if timestamps_enabled:
-            timestamps_path = session_dir / "transcript_timestamps.json"
-            with open(timestamps_path, "w", encoding="utf-8") as f:
-                json.dump(timestamps, f, indent=2, ensure_ascii=False)
-        
-        # Save speaker-attributed transcript (canonical JSON)
-        if aligned_segments:
-            transcript_by_speaker_json = session_dir / "transcript_by_speaker.json"
-            with open(transcript_by_speaker_json, "w", encoding="utf-8") as f:
-                json.dump(aligned_segments, f, indent=2, ensure_ascii=False)
-            
-            # Save human-readable speaker transcript
-            transcript_by_speaker_txt = session_dir / "transcript_by_speaker.txt"
-            with open(transcript_by_speaker_txt, "w", encoding="utf-8") as f:
-                for seg in aligned_segments:
-                    speaker_label = seg.get("speaker", "SPEAKER_00")
-                    start_time = seg.get("start", 0)
-                    end_time = seg.get("end", 0)
-                    text = seg.get("text", "")
-                    f.write(f"[{start_time:.2f}s - {end_time:.2f}s] {speaker_label}: {text}\n")
-        
-        # Generate subtitle files (with speaker labels if available)
-        if timestamps_enabled and timestamps:
-            if aligned_segments:
-                generate_subtitles_with_speakers(session_dir, aligned_segments)
-            else:
-                generate_subtitles(session_dir, timestamps)
-        
-        # Generate summary
-        summary = generate_summary(transcript)
-        summary_path = session_dir / "summary.json"
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
-        
-        # Generate analytics
-        analytics = generate_analytics(transcript, timestamps)
-        analytics_path = session_dir / "analytics.json"
-        with open(analytics_path, "w", encoding="utf-8") as f:
-            json.dump(analytics, f, indent=2, ensure_ascii=False)
-        
-        update_progress(session_id, "completed", 100)
-        
-        # Update status to done
-        status_path = session_dir / "status.json"
-        with open(status_path, "r") as f:
-            status_data = json.load(f)
-        
-        status_data["status"] = "done"
-        status_data["completed_at"] = datetime.now().isoformat()
-        status_data["progress"] = {
-            "upload": 100,
-            "processing": 100,
-            "stage": "completed"
-        }
-        
-        with open(status_path, "w") as f:
-            json.dump(status_data, f)
-        
-        print(f"[{session_id}] Transcription complete: Upload 100%, Processing 100%")
-    
-    except asyncio.CancelledError:
-        # Task was cancelled
-        session_dir = SESSIONS_DIR / session_id
-        status_path = session_dir / "status.json"
-        with open(status_path, "w") as f:
-            json.dump({
-                "status": "cancelled",
-                "session_id": session_id,
-                "cancelled_at": datetime.now().isoformat(),
-                "progress": {
-                    "upload": 100,
-                    "processing": 0,
-                    "stage": "cancelled"
-                }
-            }, f)
-        print(f"[{session_id}] Transcription cancelled")
-        _active_tasks.pop(session_id, None)
-    except Exception as e:
-        # Update status to error
-        session_dir = SESSIONS_DIR / session_id
-        status_path = session_dir / "status.json"
-        with open(status_path, "w") as f:
-            json.dump({
-                "status": "error",
-                "session_id": session_id,
-                "error": str(e),
-                "progress": {
-                    "upload": 100,
-                    "processing": 0,
-                    "stage": "error"
-                }
-            }, f)
-        print(f"[{session_id}] Transcription error: {e}")
-        _active_tasks.pop(session_id, None)
-
-
-@app.get("/api/session/{session_id}")
-async def get_session(session_id: str):
-    session_dir = SESSIONS_DIR / session_id
-    if not session_dir.exists():
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    status_path = session_dir / "status.json"
-    if not status_path.exists():
-        raise HTTPException(status_code=404, detail="Status not found")
-    
-    with open(status_path, "r") as f:
-        status_data = json.load(f)
-    
-    status = status_data.get("status", "unknown")
-    progress = status_data.get("progress", {"upload": 0, "processing": 0, "stage": "unknown"})
-    
-    if status != "done":
-        return {
-            "session_id": session_id,
-            "status": status,
-            "progress": progress
-        }
-    
-    # Load all results
-    transcript_path = session_dir / "transcript.txt"
-    timestamps_path = session_dir / "transcript_timestamps.json"
-    summary_path = session_dir / "summary.json"
-    analytics_path = session_dir / "analytics.json"
-    
-    result = {
-        "session_id": session_id,
-        "status": "done",
-        "progress": progress
-    }
-    
-    if transcript_path.exists():
-        result["transcript"] = transcript_path.read_text(encoding="utf-8")
-    
-    if timestamps_path.exists():
-        with open(timestamps_path, "r", encoding="utf-8") as f:
-            result["timestamps"] = json.load(f)
-    
-    if summary_path.exists():
-        with open(summary_path, "r", encoding="utf-8") as f:
-            result["summary"] = json.load(f)
-    
-    if analytics_path.exists():
-        with open(analytics_path, "r", encoding="utf-8") as f:
-            result["analytics"] = json.load(f)
-    
-    return result
-
-
-@app.get("/api/sessions")
-async def list_sessions():
-    sessions = []
-    if SESSIONS_DIR.exists():
-        for session_dir in SESSIONS_DIR.iterdir():
-            if session_dir.is_dir():
-                status_path = session_dir / "status.json"
-                if status_path.exists():
-                    with open(status_path, "r") as f:
-                        status_data = json.load(f)
-                    sessions.append({
-                        "session_id": session_dir.name,
-                        "status": status_data.get("status", "unknown"),
-                        "created_at": status_data.get("created_at", "")
-                    })
-    return {"sessions": sessions}
-
-
-@app.post("/api/cancel/{session_id}")
-async def cancel_transcription(session_id: str):
-    """Cancel a queued transcription job (if not yet started)."""
-    session_dir = SESSIONS_DIR / session_id
-    if not session_dir.exists():
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    status_path = session_dir / "status.json"
-    if status_path.exists():
-        with open(status_path, "r") as f:
-            status_data = json.load(f)
-        
-        current_status = status_data.get("status")
-        if current_status == "running":
-            return {"session_id": session_id, "status": "cannot_cancel", "message": "Job already running, cannot cancel"}
-        elif current_status == "done":
-            return {"session_id": session_id, "status": "already_complete", "message": "Task already completed"}
-        elif current_status in ["pending", "uploaded"]:
-            # Update status to cancelled
-            status_data["status"] = "cancelled"
-            status_data["cancelled_at"] = datetime.now().isoformat()
-            status_data["progress"] = {
-                "upload": 100,
-                "processing": 0,
-                "stage": "cancelled"
-            }
-            with open(status_path, "w") as f:
-                json.dump(status_data, f)
-            
-            # Note: Job may still be in Redis queue, but worker will skip if status is cancelled
-            return {"session_id": session_id, "status": "cancelled", "message": "Transcription cancelled"}
-    
-    return {"session_id": session_id, "status": "not_found", "message": "Session not found"}
-
-
-@app.get("/api/download/{session_id}/{filename}")
-async def download_file(session_id: str, filename: str):
-    # Security: prevent path traversal
-    if ".." in filename or "/" in filename or "\\" in filename:
-        raise HTTPException(status_code=400, detail="Invalid filename")
-
-    session_dir = SESSIONS_DIR / session_id
-    if not session_dir.exists():
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    # Load metadata for original filename
-    metadata_path = session_dir / "metadata.json"
-    original_filename = "audio.wav"
-    if metadata_path.exists():
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-            original_filename = metadata.get("original_filename", "audio.wav")
-
-    # Extract base name without extension and sanitize for ASCII
-    base_name = Path(original_filename).stem
-
-    # Sanitize base_name to ASCII-safe characters
-    # First try to use as-is if already ASCII
-    try:
-        base_name.encode('ascii')
-        safe_base_name = base_name
-    except UnicodeEncodeError:
-        # Try transliterating Cyrillic characters to Latin
-        cyrillic_to_latin = {
-            'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
-            'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
-            'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-            'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
-            'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
-            'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ё': 'Yo',
-            'Ж': 'Zh', 'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M',
-            'Н': 'N', 'О': 'O', 'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U',
-            'Ф': 'F', 'Х': 'H', 'Ц': 'Ts', 'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Sch',
-            'Ъ': '', 'Ы': 'Y', 'Ь': '', 'Э': 'E', 'Ю': 'Yu', 'Я': 'Ya'
-        }
-        transliterated = ''.join(cyrillic_to_latin.get(c, c) for c in base_name)
-
-        # Check if transliteration made it ASCII-safe
-        try:
-            transliterated.encode('ascii')
-            safe_base_name = transliterated
-        except UnicodeEncodeError:
-            # Still has non-ASCII characters, use session_id as fallback
-            safe_base_name = session_id[:8]
-
-    # Map internal filenames to user-friendly names with sanitized base name
-    file_mapping = {
-        "audio.wav": f"{safe_base_name}.wav",
-        "transcript.txt": f"TRANSC_{safe_base_name}.txt",
-        "transcript_by_speaker.txt": f"TRANSC_{safe_base_name}.txt",
-        "transcript_by_speaker.json": f"TRANSC_{safe_base_name}.json",
-        "transcript_timestamps.json": f"TRANSC_{safe_base_name}_timestamps.json",
-        "subtitles.srt": f"SUB_{safe_base_name}.srt",
-        "subtitles.vtt": f"SUB_{safe_base_name}.vtt",
-        "summary.json": f"{safe_base_name}_summary.json",
-        "analytics.json": f"{safe_base_name}_analytics.json"
+    // 2. Upload file as single chunk
+    setProgress('Uploading…', 10);
+    const form = new FormData();
+    form.append('file', _selectedFile);
+    form.append('chunk_index', '0');
+    form.append('is_final', 'true');
+    const ur = await apiFetch(`/api/v2/sessions/${session_id}/chunks`, {
+      method: 'POST',
+      body: form,
+      headers: {},  // let browser set multipart boundary
+    });
+    if (!ur || !ur.ok) {
+      const err = ur ? await ur.text() : 'upload failed';
+      setProgress('Upload failed: ' + err);
+      btn.disabled = false; return;
     }
 
-    # Check if requesting a mapped file
-    download_filename = file_mapping.get(filename, filename)
-    file_path = session_dir / filename
+    // 3. Finalize
+    setProgress('Queuing job…', 60);
+    const body = { model_size: model };
+    if (lang) body.language = lang;
+    if (numSpk > 0) body.num_speakers = numSpk;
+    const fr = await apiFetch(`/api/v2/sessions/${session_id}/finalize`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    if (!fr || !fr.ok) { setProgress('Finalize failed.'); btn.disabled = false; return; }
+    const { job_id } = await fr.json();
 
-    # Allow all files in session directory (with security check)
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
+    setProgress('Job queued — polling…', 80);
+    showMsg('Job started: ' + job_id, 'ok');
+    loadSessions();
 
-    # Determine media type
-    ext = Path(download_filename).suffix.lower()
-    media_types = {
-        ".wav": "audio/wav",
-        ".txt": "text/plain",
-        ".json": "application/json",
-        ".srt": "text/srt",
-        ".vtt": "text/vtt"
+    // 4. Poll until done / error
+    pollJob(job_id, session_id, btn);
+
+  } catch(e) {
+    setProgress('Error: ' + e.message);
+    btn.disabled = false;
+  }
+}
+
+function setProgress(text, pct) {
+  const el = document.getElementById('upload-progress');
+  if (pct !== undefined) {
+    el.innerHTML = `<span>${text}</span><div class="prog-bar"><div class="prog-fill" style="width:${pct}%"></div></div>`;
+  } else {
+    el.textContent = text;
+  }
+}
+
+function pollJob(jobId, sessionId, btn) {
+  clearTimeout(_pollTimer);
+  async function tick() {
+    const res = await apiFetch(`/api/v2/jobs/${jobId}`);
+    if (!res) return;
+    const d = await res.json();
+    const pct = d.progress ? Math.round((d.progress.processing || 0)) : null;
+    const state = d.state || 'unknown';
+    if (state === 'done') {
+      setProgress('Done!', 100);
+      btn.disabled = false;
+      loadSessions();
+      openSession(sessionId);
+    } else if (state === 'error') {
+      setProgress('Worker error — see session detail.');
+      btn.disabled = false;
+      loadSessions();
+      openSession(sessionId);
+    } else {
+      setProgress(state + (pct !== null ? ' ' + pct + '%' : '…'), pct || 85);
+      _pollTimer = setTimeout(tick, 2500);
     }
-    media_type = media_types.get(ext, "application/octet-stream")
+  }
+  _pollTimer = setTimeout(tick, 2000);
+}
 
-    # Use safe ASCII filename for Content-Disposition header
-    return FileResponse(
-        path=str(file_path),
-        filename=download_filename,
-        media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{download_filename}"'}
-    )
+// ── Session detail ────────────────────────────────────────────────────
+function lookupSession() {
+  const id = document.getElementById('lookup-id').value.trim();
+  if (id) openSession(id);
+}
+
+async function openSession(id) {
+  document.getElementById('lookup-id').value = id;
+  const detail = document.getElementById('detail');
+  detail.style.display = 'block';
+  document.getElementById('detail-title').textContent = 'Session: ' + id;
+  const body = document.getElementById('detail-body');
+  body.innerHTML = '<p style="color:#555;font-size:12px">Loading…</p>';
+  detail.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  const jobRes = await apiFetch(`/api/v2/jobs/${id}`);
+  let jobData = jobRes && jobRes.ok ? await jobRes.json() : null;
+
+  let html = '';
+
+  if (jobData) {
+    html += `<div class="section-title">Job Status</div>`;
+    html += `<pre>${escHtml(JSON.stringify(jobData, null, 2))}</pre>`;
+  } else {
+    html += `<p style="color:#555;font-size:12px">No job data found.</p>`;
+  }
+
+  if (jobData && jobData.state === 'done') {
+    const txRes = await apiFetch(`/api/v2/sessions/${id}/transcript`);
+    if (txRes && txRes.ok) {
+      const tx = await txRes.json();
+      html += `<div class="section-title">Transcript</div>`;
+      html += `<div class="transcript-text">${escHtml(tx.text || '(empty)')}</div>`;
+      if (tx.segments && tx.segments.length) {
+        html += `<div class="section-title">Segments (${tx.segments.length})</div><pre>`;
+        html += tx.segments.slice(0, 40).map(s =>
+          '[' + (s.start_ms/1000).toFixed(2) + 's] ' + s.speaker + ': ' + s.text
+        ).join('\\n');
+        if (tx.segments.length > 40) html += '\\n… (' + (tx.segments.length - 40) + ' more)';
+        html += '</pre>';
+      }
+    }
+  }
+
+  if (jobData && jobData.state === 'error') {
+    const errRes = await apiFetch(`/api/v2/jobs/${id}/error`);
+    if (errRes && errRes.ok) {
+      const err = await errRes.json();
+      html += `<div class="section-title">Error Detail</div>`;
+      html += `<pre style="color:#f88">${escHtml(JSON.stringify(err, null, 2))}</pre>`;
+    }
+  }
+
+  html += `<div class="actions">
+    <button class="btn" onclick="openSession('${id}')">↻ Refresh</button>`;
+  if (jobData && jobData.state === 'done') {
+    html += `<button class="btn" onclick="downloadSubtitle('${id}','srt')">↓ SRT</button>`;
+    html += `<button class="btn" onclick="downloadSubtitle('${id}','vtt')">↓ VTT</button>`;
+  }
+  html += `<button class="btn danger" onclick="deleteSession('${id}')">Delete</button>`;
+  html += `</div>`;
+
+  body.innerHTML = html;
+}
+
+async function deleteSession(id) {
+  if (!confirm('Delete session ' + id + '? This cannot be undone.')) return;
+  const res = await apiFetch(`/api/v2/sessions/${id}`, { method: 'DELETE' });
+  if (res && res.ok) {
+    showMsg('Session deleted.', 'ok');
+    document.getElementById('detail').style.display = 'none';
+    loadSessions();
+  } else {
+    showMsg('Delete failed.', 'err');
+  }
+}
+
+async function downloadSubtitle(id, fmt) {
+  const res = await apiFetch(`/api/v2/sessions/${id}/subtitle.${fmt}`);
+  if (!res || !res.ok) { showMsg('Failed to download ' + fmt.toUpperCase(), 'err'); return; }
+  const text = await res.text();
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = id + '.' + fmt; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('token-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') saveToken();
+  });
+  if (getToken()) showDashboard();
+});
+</script>
+</body>
+</html>"""
 
 
-def generate_subtitles(session_dir: Path, timestamps: List[Dict]):
-    """Generate SRT and VTT subtitle files from timestamps."""
-    # SRT format
-    srt_lines = []
-    for i, item in enumerate(timestamps, 1):
-        start = format_timestamp_srt(item["start"])
-        end = format_timestamp_srt(item["end"])
-        text = item["text"].strip()
-        srt_lines.append(f"{i}\n{start} --> {end}\n{text}\n")
-    
-    srt_path = session_dir / "subtitles.srt"
-    srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
-    
-    # VTT format
-    vtt_lines = ["WEBVTT", ""]
-    for item in timestamps:
-        start = format_timestamp_vtt(item["start"])
-        end = format_timestamp_vtt(item["end"])
-        text = item["text"].strip()
-        vtt_lines.append(f"{start} --> {end}\n{text}")
-    
-    vtt_path = session_dir / "subtitles.vtt"
-    vtt_path.write_text("\n".join(vtt_lines), encoding="utf-8")
-
-
-def generate_subtitles_with_speakers(session_dir: Path, aligned_segments: List[Dict]):
-    """Generate SRT and VTT subtitle files with speaker labels."""
-    # SRT format
-    srt_lines = []
-    for i, item in enumerate(aligned_segments, 1):
-        start = format_timestamp_srt(item["start"])
-        end = format_timestamp_srt(item["end"])
-        speaker = item.get("speaker", "SPEAKER_00")
-        text = item["text"].strip()
-        # Include speaker in subtitle text
-        srt_lines.append(f"{i}\n{start} --> {end}\n[{speaker}] {text}\n")
-    
-    srt_path = session_dir / "subtitles.srt"
-    srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
-    
-    # VTT format
-    vtt_lines = ["WEBVTT", ""]
-    for item in aligned_segments:
-        start = format_timestamp_vtt(item["start"])
-        end = format_timestamp_vtt(item["end"])
-        speaker = item.get("speaker", "SPEAKER_00")
-        text = item["text"].strip()
-        vtt_lines.append(f"{start} --> {end}\n[{speaker}] {text}")
-    
-    vtt_path = session_dir / "subtitles.vtt"
-    vtt_path.write_text("\n".join(vtt_lines), encoding="utf-8")
-
-
-def format_timestamp_srt(seconds: float) -> str:
-    """Format timestamp for SRT: HH:MM:SS,mmm"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds % 1) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-
-def format_timestamp_vtt(seconds: float) -> str:
-    """Format timestamp for VTT: HH:MM:SS.mmm"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds % 1) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
+# ---------------------------------------------------------------------------
+# Mount API v2
+# ---------------------------------------------------------------------------
+app.include_router(api_v2_router)
