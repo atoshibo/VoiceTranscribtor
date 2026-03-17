@@ -265,6 +265,7 @@ def transcribe_audio(
     model_size: str = None,
     timestamps_enabled: bool = True,
     progress_callback: Optional[Callable[[int], None]] = None,
+    segment_callback: Optional[Callable[[List[Dict]], None]] = None,
     # Legacy params (kept for call-site compatibility with old worker code)
     diarization_enabled: bool = False,
     speaker_count: int = 1,
@@ -273,6 +274,10 @@ def transcribe_audio(
     Transcribe audio. Returns (full_text, segments).
 
     Each segment: {"start": float, "end": float, "text": str}
+
+    segment_callback(last_segments): called every 5 segments with the last 2
+    collected so callers can surface a live partial preview without waiting for
+    the full transcription to complete.
     """
     model = get_model(model_size)
 
@@ -316,8 +321,11 @@ def transcribe_audio(
         if text:
             parts.append(text)
             timestamps.append({"start": round(seg.start, 2), "end": round(seg.end, 2), "text": text})
-        if progress_callback and n % 5 == 0:
-            progress_callback(_smooth_progress(n))
+        if n % 5 == 0:
+            if progress_callback:
+                progress_callback(_smooth_progress(n))
+            if segment_callback and timestamps:
+                segment_callback(timestamps[-2:])
 
     lang = getattr(info, "language", None)
     prob = getattr(info, "language_probability", 0.0)
