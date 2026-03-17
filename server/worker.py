@@ -1,13 +1,21 @@
 """
 Worker service that processes transcription jobs from Redis queue.
 Runs heavy GPU operations (preprocessing, diarization, transcription).
+
+Queues:
+  REDIS_QUEUE         — main finalized jobs (job_type: v2 or legacy)
+  REDIS_PARTIAL_QUEUE — provisional partial transcription jobs (job_type: v2_partial)
+
+The worker polls the main queue first (priority), then the partial queue.
 """
 import os
 import json
 import redis
 import time
+import shutil
+import wave
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 import sys
 import traceback
 
@@ -20,6 +28,7 @@ from audio_preprocess import preprocess_audio
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_QUEUE = os.getenv("REDIS_QUEUE", "transcription_jobs")
+REDIS_PARTIAL_QUEUE = os.getenv("REDIS_PARTIAL_QUEUE", REDIS_QUEUE + "_partial")
 SESSIONS_DIR = Path(os.getenv("SESSIONS_DIR", "/data/sessions"))
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "1"))  # Only 1 GPU job at a time
 
@@ -29,6 +38,10 @@ STATUS_RUNNING = "running"
 STATUS_DONE = "done"
 STATUS_ERROR = "error"
 STATUS_CANCELLED = "cancelled"
+
+
+def _utcnow_str() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 # -----------------------------
@@ -46,7 +59,6 @@ def _safe_read_json(path: Path, retries: int = 10, sleep_s: float = 0.05) -> Dic
     last_err = None
     for _ in range(retries):
         try:
-            # If file is empty (size 0), retry
             try:
                 if path.stat().st_size == 0:
                     time.sleep(sleep_s)
@@ -71,7 +83,6 @@ def _safe_read_json(path: Path, retries: int = 10, sleep_s: float = 0.05) -> Dic
             time.sleep(sleep_s)
             continue
 
-    # Give up safely
     if last_err:
         print(f"[WARN] Failed to read JSON after retries: {path} ({last_err})")
     return {}
@@ -101,20 +112,29 @@ def update_session_status(
     error: Optional[str] = None,
     progress: Optional[Dict[str, Any]] = None
 ) -> None:
-    """Update session status.json file safely and atomically."""
+    """Update session status.json file safely and atomically.
+
+    Automatically tracks started_at (first time status=running) and
+    finished_at (when status=done or error).
+    """
     session_dir = SESSIONS_DIR / session_id
     status_path = session_dir / "status.json"
 
-    # Load existing safely (could be empty/partial)
     existing = _safe_read_json(status_path)
-
-    # Start from existing, then override with new values (IMPORTANT)
     status_data = dict(existing) if isinstance(existing, dict) else {}
 
     status_data.update({
         "status": status,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "updated_at": _utcnow_str(),
     })
+
+    # Track started_at on first transition to running
+    if status == STATUS_RUNNING and "started_at" not in status_data:
+        status_data["started_at"] = _utcnow_str()
+
+    # Track finished_at on terminal states
+    if status in (STATUS_DONE, STATUS_ERROR):
+        status_data["finished_at"] = _utcnow_str()
 
     if error:
         status_data["error"] = error
@@ -201,6 +221,51 @@ def generate_subtitles_with_speakers(session_dir: Path, aligned_segments: list) 
 
 
 # -----------------------------
+# WAV merge helper (for partial jobs)
+# -----------------------------
+def _merge_chunks_to_path(chunk_paths: List[Path], output_path: Path) -> None:
+    """Merge ordered WAV chunks into output_path. Skips incompatible chunks."""
+    if not chunk_paths:
+        raise ValueError("No chunks to merge.")
+
+    if len(chunk_paths) == 1:
+        shutil.copy2(str(chunk_paths[0]), str(output_path))
+        return
+
+    ref_nchannels = ref_sampwidth = ref_framerate = None
+    for cp in chunk_paths:
+        try:
+            with wave.open(str(cp), "rb") as w:
+                ref_nchannels = w.getnchannels()
+                ref_sampwidth = w.getsampwidth()
+                ref_framerate = w.getframerate()
+            break
+        except Exception:
+            pass
+
+    if ref_nchannels is None:
+        raise ValueError("Could not determine WAV format from chunks.")
+
+    with wave.open(str(output_path), "wb") as out:
+        out.setnchannels(ref_nchannels)
+        out.setsampwidth(ref_sampwidth)
+        out.setframerate(ref_framerate)
+        for cp in chunk_paths:
+            try:
+                with wave.open(str(cp), "rb") as w:
+                    if (
+                        w.getnchannels() == ref_nchannels
+                        and w.getsampwidth() == ref_sampwidth
+                        and w.getframerate() == ref_framerate
+                    ):
+                        out.writeframes(w.readframes(w.getnframes()))
+                    else:
+                        print(f"[PARTIAL-MERGE] Skipping {cp.name}: incompatible format")
+            except Exception as e:
+                print(f"[PARTIAL-MERGE] Skipping {cp.name}: {e}")
+
+
+# -----------------------------
 # Job processing
 # -----------------------------
 def _derive_action_hint(error_msg: str) -> str:
@@ -251,15 +316,13 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
             print(f"[{session_id}] Already processed, skipping")
             return
 
-        # If cancelled, skip
         if existing_status.get("status") == STATUS_CANCELLED:
             print(f"[{session_id}] Job cancelled, skipping")
             return
 
-        # Set running
+        # Set running (records started_at automatically)
         update_session_status(session_id, STATUS_RUNNING)
 
-        # Load metadata safely
         metadata_path = session_dir / "metadata.json"
         metadata = _safe_read_json(metadata_path)
 
@@ -329,11 +392,9 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
         # Save transcript
         (session_dir / "transcript.txt").write_text(transcript, encoding="utf-8")
 
-        # Save timestamps
         if timestamps_enabled:
             _atomic_write_json(session_dir / "transcript_timestamps.json", timestamps)
 
-        # Save speaker transcript
         if aligned_segments:
             _atomic_write_json(session_dir / "transcript_by_speaker.json", aligned_segments)
 
@@ -345,18 +406,16 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
                     text = seg.get("text", "")
                     f.write(f"[{start_time:.2f}s - {end_time:.2f}s] {speaker_label}: {text}\n")
 
-        # Subtitles
         if timestamps_enabled and timestamps:
             if aligned_segments:
                 generate_subtitles_with_speakers(session_dir, aligned_segments)
             else:
                 generate_subtitles(session_dir, timestamps)
 
-        # Summary + analytics
         _atomic_write_json(session_dir / "summary.json", generate_summary(transcript))
         _atomic_write_json(session_dir / "analytics.json", generate_analytics(transcript, timestamps))
 
-        # Done
+        # Done (records finished_at automatically)
         update_session_status(
             session_id,
             STATUS_DONE,
@@ -370,17 +429,17 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
         tb_str = traceback.format_exc()
         traceback.print_exc()
 
-        # Write detailed error.json for API v2 and diagnostics
         error_payload: Dict[str, Any] = {
             "error_type": type(e).__name__,
             "error_message": error_msg,
             "traceback": tb_str,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timestamp": _utcnow_str(),
             "stage": "transcription",
             "action_hint": _derive_action_hint(error_msg),
         }
         _atomic_write_json(session_dir / "error.json", error_payload)
 
+        # Records finished_at automatically
         update_session_status(
             session_id,
             STATUS_ERROR,
@@ -389,11 +448,105 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
         )
 
 
+def process_partial_job(job_data: Dict[str, Any]) -> None:
+    """
+    Process a provisional partial transcription job.
+
+    Merges available chunks (without touching the final audio.wav),
+    runs a quick transcription pass, and writes partial_transcript.json.
+    Always releases the partial_pending lockfile when done.
+
+    Does NOT modify status.json — partial transcription is transparent to the
+    main job pipeline and the UI progress bar.
+    """
+    session_id = job_data["session_id"]
+    session_dir = SESSIONS_DIR / session_id
+    pending_flag = session_dir / "partial_pending"
+
+    print(f"[{session_id}] Starting partial transcription")
+
+    try:
+        # Load v2_session.json to get current chunk list
+        session_path = session_dir / "v2_session.json"
+        session_data = _safe_read_json(session_path)
+
+        chunks = session_data.get("chunks", [])
+        if not chunks:
+            print(f"[{session_id}] No chunks for partial — skipping")
+            return
+
+        # Gather chunk files in order
+        chunk_paths: List[Path] = []
+        for ci in sorted(chunks, key=lambda c: c["chunk_index"]):
+            p = session_dir / "chunks" / f"chunk_{ci['chunk_index']:04d}.wav"
+            if p.exists():
+                chunk_paths.append(p)
+
+        if not chunk_paths:
+            print(f"[{session_id}] No chunk files on disk for partial — skipping")
+            return
+
+        # Merge to a temporary partial audio file (never touches audio.wav)
+        partial_audio = session_dir / "audio_partial.wav"
+        _merge_chunks_to_path(chunk_paths, partial_audio)
+
+        # Transcription params (best-effort from metadata or job_data)
+        metadata = _safe_read_json(session_dir / "metadata.json")
+        language = job_data.get("language") or metadata.get("language") or None
+        model_size = job_data.get("model_size") or metadata.get("model_size") or "base"
+
+        transcript, timestamps = transcribe_audio(
+            str(partial_audio),
+            language=language,
+            model_size=model_size,
+            timestamps_enabled=True,
+        )
+
+        segments = [
+            {
+                "start_ms": int(seg["start"] * 1000),
+                "end_ms": int(seg["end"] * 1000),
+                "text": seg["text"],
+            }
+            for seg in timestamps
+        ]
+
+        partial_result = {
+            "text": transcript,
+            "segments": segments,
+            "chunk_count_at_time": len(chunks),
+            "generated_at": _utcnow_str(),
+            "provisional": True,
+        }
+        _atomic_write_json(session_dir / "partial_transcript.json", partial_result)
+
+        # Advance v2 session state to partially_processed (if still pre-finalization)
+        if session_data.get("state") in ("receiving", "chunks_complete"):
+            session_data["state"] = "partially_processed"
+            _atomic_write_json(session_path, session_data)
+
+        print(
+            f"[{session_id}] Partial transcription done: "
+            f"{len(segments)} segments, {len(chunks)} chunks processed"
+        )
+
+    except Exception as e:
+        print(f"[{session_id}] Partial transcription failed (non-fatal): {e}")
+        traceback.print_exc()
+    finally:
+        # Always release the lock so future chunk uploads can trigger new partials
+        try:
+            pending_flag.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def main() -> None:
     print("=" * 50)
     print("Starting Transcription Worker")
     print(f"Redis: {REDIS_HOST}:{REDIS_PORT}")
-    print(f"Queue: {REDIS_QUEUE}")
+    print(f"Main queue: {REDIS_QUEUE}")
+    print(f"Partial queue: {REDIS_PARTIAL_QUEUE}")
     print(f"Concurrency: {WORKER_CONCURRENCY}")
     print("=" * 50)
 
@@ -447,7 +600,7 @@ def main() -> None:
                 "gpu_reason": gpu_reason,
                 "selected_compute_type": selected_compute_type,
                 "strict_cuda": strict_cuda,
-                "worker_started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "worker_started_at": _utcnow_str(),
             })
         except Exception:
             pass
@@ -455,26 +608,31 @@ def main() -> None:
     except Exception as e:
         print(f"[GPU-HEALTH] Failed to run CUDA health check: {e}")
 
+    # Main event loop: drain the main queue first, then process partials
     while True:
         try:
-            result = r.blpop(REDIS_QUEUE, timeout=5)
+            result = r.blpop([REDIS_QUEUE, REDIS_PARTIAL_QUEUE], timeout=5)
             if result is None:
                 continue
 
-            _, job_json = result
+            queue_name, job_json = result
             job_data = json.loads(job_json)
             session_id = job_data["session_id"]
+            job_type = job_data.get("job_type", "")
 
-            print(f"Received job: {session_id}")
+            print(f"Received job: {session_id} (type={job_type or 'legacy'}, queue={queue_name})")
 
-            # Cancel check (safe read)
-            status_path = (SESSIONS_DIR / session_id) / "status.json"
-            status_data = _safe_read_json(status_path)
-            if status_data.get("status") == STATUS_CANCELLED:
-                print(f"[{session_id}] Job was cancelled, skipping")
-                continue
+            if job_type == "v2_partial":
+                process_partial_job(job_data)
+            else:
+                # Cancel check for main jobs
+                status_path = (SESSIONS_DIR / session_id) / "status.json"
+                status_data = _safe_read_json(status_path)
+                if status_data.get("status") == STATUS_CANCELLED:
+                    print(f"[{session_id}] Job was cancelled, skipping")
+                    continue
 
-            process_transcription_job(job_data)
+                process_transcription_job(job_data)
 
         except KeyboardInterrupt:
             print("\nShutting down worker...")

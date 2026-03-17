@@ -112,6 +112,34 @@ class TestAuth:
 
 
 # ---------------------------------------------------------------------------
+# GPU monitoring endpoint
+# ---------------------------------------------------------------------------
+class TestGPUStatus:
+    def test_gpu_status_requires_auth(self, base_url):
+        r = requests.get(f"{base_url}/api/v2/system/gpu", timeout=5)
+        assert r.status_code == 401
+
+    def test_gpu_status_shape(self, base_url, auth_headers):
+        if not auth_headers.get("Authorization", "").endswith(" "):
+            pass  # token may be empty, test may 401
+        r = requests.get(f"{base_url}/api/v2/system/gpu", headers=auth_headers, timeout=10)
+        if r.status_code == 403:
+            pytest.skip("No valid token configured")
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text}"
+        data = r.json()
+        assert "gpu_available" in data
+        assert "active_jobs" in data
+        assert isinstance(data["active_jobs"], list)
+        assert "queue_depth" in data
+        assert isinstance(data["queue_depth"], int)
+        assert "partial_queue_depth" in data
+        assert isinstance(data["partial_queue_depth"], int)
+        assert "processing_stats" in data
+        assert "active_job_count" in data
+        assert "timestamp" in data
+
+
+# ---------------------------------------------------------------------------
 # Full integration flow
 # ---------------------------------------------------------------------------
 class TestSessionFlow:
@@ -164,6 +192,22 @@ class TestSessionFlow:
         data = r.json()
         assert data["accepted"] is True
         assert data["chunk_index"] == 0
+        assert "chunk_count" in data
+
+    def test_session_status_receiving(self, base_url, auth_headers, session_id):
+        """After first chunk, session state should be 'receiving'."""
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{session_id}/status",
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200, f"Get session status failed: {r.text}"
+        data = r.json()
+        assert data["state"] == "receiving", f"Expected 'receiving', got '{data['state']}'"
+        assert data["chunk_count"] == 1
+        assert data["first_chunk_at"] is not None
+        assert data["last_chunk_at"] is not None
+        assert "partial_transcript_available" in data
 
     def test_upload_chunk_1_final(self, base_url, auth_headers, session_id):
         wav_bytes = make_wav_bytes(duration_s=1.0)
@@ -200,6 +244,20 @@ class TestSessionFlow:
         assert "job_id" in data
         assert "status_url" in data
 
+    def test_session_status_queued_after_finalize(self, base_url, auth_headers, session_id):
+        """After finalize, session status endpoint should show 'queued' or later."""
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{session_id}/status",
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["state"] in ("queued", "running", "done", "error"), \
+            f"Unexpected state: {data['state']}"
+        assert data["finalize_requested_at"] is not None
+        assert data["queued_at"] is not None
+
     def test_job_status_queued_or_running(self, base_url, auth_headers, session_id):
         r = requests.get(
             f"{base_url}/api/v2/jobs/{session_id}",
@@ -210,7 +268,12 @@ class TestSessionFlow:
         data = r.json()
         assert data["state"] in ("queued", "running", "done", "error"), \
             f"Unexpected state: {data['state']}"
-        assert 0.0 <= data["progress"] <= 1.0
+        # progress is a dict with processing (0-100) and stage fields
+        assert isinstance(data["progress"], dict), \
+            f"progress should be a dict, got {type(data['progress'])}"
+        assert 0 <= data["progress"].get("processing", 0) <= 100
+        # Timing fields present
+        assert "queued_at" in data
 
     def test_poll_until_done_or_timeout(self, base_url, auth_headers, session_id):
         """Poll with exponential back-off for up to 120s."""
@@ -231,13 +294,23 @@ class TestSessionFlow:
             if state in ("done", "error"):
                 break
 
-        # It's OK if we hit timeout (worker may not be running in test env)
-        # but state should be one of the valid values
         assert state in ("queued", "running", "done", "error"), f"Unexpected state: {state}"
+
+    def test_job_timing_fields_when_done(self, base_url, auth_headers, session_id):
+        """When job is done, started_at and finished_at should be present."""
+        r = requests.get(
+            f"{base_url}/api/v2/jobs/{session_id}",
+            headers=auth_headers,
+            timeout=10,
+        )
+        data = r.json()
+        if data["state"] != "done":
+            pytest.skip(f"Job not done yet (state={data['state']})")
+        assert data.get("started_at") is not None
+        assert data.get("finished_at") is not None
 
     def test_get_transcript_when_done(self, base_url, auth_headers, session_id):
         """If job is done, transcript should have expected shape."""
-        # Check current state
         r = requests.get(
             f"{base_url}/api/v2/jobs/{session_id}",
             headers=auth_headers,
@@ -265,7 +338,6 @@ class TestSessionFlow:
 
     def test_transcript_returns_202_when_not_done(self, base_url, auth_headers):
         """A freshly created session that was never finalized should return 404 or 202."""
-        # Create a new session but don't finalize it
         r = requests.post(
             f"{base_url}/api/v2/sessions",
             json={},
@@ -273,7 +345,6 @@ class TestSessionFlow:
             timeout=10,
         )
         sid = r.json()["session_id"]
-        # Upload one chunk so state is valid
         wav_bytes = make_wav_bytes(0.5)
         requests.post(
             f"{base_url}/api/v2/sessions/{sid}/chunks",
@@ -287,7 +358,6 @@ class TestSessionFlow:
             headers=auth_headers,
             timeout=10,
         )
-        # Not done yet → 202
         assert r.status_code in (202, 404), f"Expected 202 or 404, got {r.status_code}"
 
         # Cleanup
@@ -296,6 +366,185 @@ class TestSessionFlow:
             headers=auth_headers,
             timeout=5,
         )
+
+
+# ---------------------------------------------------------------------------
+# Session status endpoint
+# ---------------------------------------------------------------------------
+class TestSessionStatus:
+    def test_session_status_created_state(self, base_url, auth_headers):
+        """A freshly created session with no chunks should be in 'created' state."""
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"mode": "stream"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200
+        sid = r.json()["session_id"]
+
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{sid}/status",
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["state"] == "created"
+        assert data["chunk_count"] == 0
+        assert data["partial_transcript_available"] is False
+        assert data["first_chunk_at"] is None
+        assert data["finalize_requested_at"] is None
+
+        requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    def test_session_status_404_for_unknown(self, base_url, auth_headers):
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/nonexistent-xyz/status",
+            headers=auth_headers,
+            timeout=5,
+        )
+        assert r.status_code == 404
+
+    def test_session_status_timing_fields_present(self, base_url, auth_headers):
+        """Timing fields should be present in the response."""
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{sid}/status",
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        for field in ("created_at", "first_chunk_at", "last_chunk_at",
+                      "finalize_requested_at", "queued_at", "started_at", "finished_at"):
+            assert field in data, f"Missing field: {field}"
+
+        requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Partial transcript endpoint
+# ---------------------------------------------------------------------------
+class TestPartialTranscript:
+    def test_partial_404_when_no_partials_yet(self, base_url, auth_headers):
+        """A freshly created session should return 404 for partial transcript."""
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"mode": "stream"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{sid}/transcript/partial",
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 404, f"Expected 404, got {r.status_code}"
+
+        requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    def test_partial_transcript_shape_when_available(self, base_url, auth_headers):
+        """
+        If partial transcript is available (worker processed it), check the shape.
+        This test is skipped if the worker hasn't run yet.
+        """
+        # Create session and upload enough chunks to trigger a partial
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"mode": "stream"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+
+        # Upload 5 chunks (default PARTIAL_EVERY_N_CHUNKS=5)
+        for i in range(5):
+            wav_bytes = make_wav_bytes(duration_s=1.0)
+            requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/chunks",
+                headers=auth_headers,
+                files={"file": (f"chunk_{i}.wav", wav_bytes, "audio/wav")},
+                data={"chunk_index": str(i), "chunk_duration_ms": "1000"},
+                timeout=30,
+            )
+
+        # Poll session status for up to 30s for partial to appear
+        deadline = time.time() + 30
+        partial_available = False
+        while time.time() < deadline:
+            time.sleep(2)
+            rs = requests.get(
+                f"{base_url}/api/v2/sessions/{sid}/status",
+                headers=auth_headers,
+                timeout=10,
+            )
+            if rs.status_code == 200 and rs.json().get("partial_transcript_available"):
+                partial_available = True
+                break
+
+        if not partial_available:
+            pytest.skip("Partial transcript not generated within 30s (worker may not be running)")
+
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{sid}/transcript/partial",
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text}"
+        data = r.json()
+        assert data["provisional"] is True
+        assert "text" in data
+        assert isinstance(data["segments"], list)
+        assert "chunk_count_at_time" in data
+        assert "generated_at" in data
+
+        requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Field normalization (Android compat)
+# ---------------------------------------------------------------------------
+class TestFieldNormalization:
+    def test_num_speakers_alias(self, base_url, auth_headers):
+        """num_speakers should be accepted as an alias for speaker_count in finalize."""
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+
+        wav_bytes = make_wav_bytes(0.5)
+        requests.post(
+            f"{base_url}/api/v2/sessions/{sid}/chunks",
+            headers=auth_headers,
+            files={"file": ("c.wav", wav_bytes, "audio/wav")},
+            data={"chunk_index": "0"},
+            timeout=10,
+        )
+
+        # Use num_speakers (Android field) instead of speaker_count
+        r = requests.post(
+            f"{base_url}/api/v2/sessions/{sid}/finalize",
+            json={"language": "en", "model_size": "tiny", "num_speakers": 1},
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200, f"Finalize with num_speakers failed: {r.text}"
+        assert "job_id" in r.json()
+
+        requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +584,6 @@ class TestIdempotency:
         assert r1.status_code == 200
         assert r2.status_code == 200
 
-        # Cleanup
         requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
 
 
@@ -344,7 +592,6 @@ class TestIdempotency:
 # ---------------------------------------------------------------------------
 class TestDelete:
     def test_delete_session(self, base_url, auth_headers):
-        # Create and immediately delete
         r = requests.post(
             f"{base_url}/api/v2/sessions",
             json={},
@@ -402,5 +649,4 @@ class TestValidation:
         )
         assert r.status_code == 400
 
-        # Cleanup
         requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)

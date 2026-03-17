@@ -6,6 +6,10 @@ Key differences from v1:
 - Session + chunk model: create session → upload chunks → finalize → poll → get transcript
 - Rate limiting per token
 - Structured JSON transcript response with ms timestamps
+- Partial transcription support for stream-mode sessions (every PARTIAL_EVERY_N_CHUNKS chunks)
+- GPU monitoring endpoint
+- Full session state machine: created → receiving → partially_processed → finalized →
+  queued → running → done | error
 """
 import os
 import json
@@ -30,10 +34,13 @@ SESSIONS_DIR = Path(os.getenv("SESSIONS_DIR", "/data/sessions"))
 MAX_CHUNK_MB = int(os.getenv("MAX_CHUNK_MB", "30"))
 MAX_SESSION_CHUNKS = int(os.getenv("MAX_SESSION_CHUNKS", "200"))
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+# How many chunks between partial transcription triggers (0 = disabled)
+PARTIAL_EVERY_N_CHUNKS = int(os.getenv("PARTIAL_EVERY_N_CHUNKS", "5"))
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_QUEUE = os.getenv("REDIS_QUEUE", "transcription_jobs")
+REDIS_PARTIAL_QUEUE = os.getenv("REDIS_PARTIAL_QUEUE", REDIS_QUEUE + "_partial")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 
 # In-memory rate limit buckets: token_hash → list of epoch timestamps
@@ -62,10 +69,8 @@ def _get_redis():
 def _check_rate_limit(token: str) -> bool:
     """Sliding-window rate limit: max RATE_LIMIT_PER_MINUTE requests/60s per token."""
     now = time.monotonic()
-    # Use a short hash so we never store the raw token
     key = hashlib.sha256(token.encode()).hexdigest()[:16]
     bucket = _rate_buckets.setdefault(key, [])
-    # Evict old entries
     bucket[:] = [t for t in bucket if now - t < 60.0]
     if len(bucket) >= RATE_LIMIT_PER_MINUTE:
         return False
@@ -129,6 +134,90 @@ def _write_json(path: Path, data: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _derive_session_state(session_data: dict, status_data: dict) -> str:
+    """
+    Derive the observable session state from v2_session.json + status.json.
+
+    Priority: worker terminal states (done/running/error) override v2 session state.
+    Full state machine:
+        created → receiving → partially_processed → finalized →
+        queued → running → done | error
+    """
+    worker_status = status_data.get("status", "")
+    v2_state = session_data.get("state", "created")
+
+    if worker_status == "done":
+        return "done"
+    if worker_status in ("processing", "running"):
+        return "running"
+    if worker_status == "error":
+        return "error"
+    if worker_status in ("uploaded", "pending") or v2_state == "finalized":
+        return "queued"
+    if v2_state == "partially_processed":
+        return "partially_processed"
+    if v2_state in ("receiving", "chunks_complete"):
+        return "receiving"
+    return "created"
+
+
+def _trigger_partial(session_id: str, session_dir: Path, session_data: dict) -> None:
+    """
+    Enqueue a partial transcription job if not already pending.
+
+    Uses a lockfile (partial_pending) to prevent queuing more than one
+    partial job per session at a time. The worker removes the lockfile when done.
+
+    Note: if the worker crashes mid-partial, the lockfile may linger and suppress
+    further partial jobs. This is acceptable — the final finalize() transcript will
+    still work correctly.
+    """
+    pending_flag = session_dir / "partial_pending"
+    if pending_flag.exists():
+        return  # already one in flight
+
+    # Best-effort: read existing metadata for language/model params
+    metadata: dict = {}
+    metadata_path = session_dir / "metadata.json"
+    if metadata_path.exists():
+        try:
+            metadata = _read_json(metadata_path)
+        except Exception:
+            pass
+
+    # Claim the lock before enqueuing to avoid races
+    try:
+        pending_flag.touch()
+    except Exception:
+        return
+
+    r = _get_redis()
+    if r:
+        try:
+            job_data = {
+                "session_id": session_id,
+                "job_type": "v2_partial",
+                "language": metadata.get("language"),
+                "speaker_count": metadata.get("speaker_count", 1),
+                "model_size": metadata.get("model_size", "base"),
+                "timestamps": True,
+            }
+            r.rpush(REDIS_PARTIAL_QUEUE, json.dumps(job_data))
+            print(f"[V2] Enqueued partial job for session {session_id}")
+        except Exception as e:
+            print(f"[V2] Warning: failed to enqueue partial job: {e}")
+            try:
+                pending_flag.unlink(missing_ok=True)
+            except Exception:
+                pass
+    else:
+        # No Redis — release lock so next chunk can retry
+        try:
+            pending_flag.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +296,6 @@ async def health():
     selected_compute_type = "none"
     strict_cuda = True
 
-    # Read worker health from shared file (written by worker on startup)
     worker_health_path = SESSIONS_DIR.parent / "worker_health.json"
     if worker_health_path.exists():
         try:
@@ -221,12 +309,109 @@ async def health():
 
     return {
         "ok": True,
-        "version": "2.0.0",
+        "version": "2.1.0",
         "gpu_available": gpu_available,
         "gpu_reason": gpu_reason,
         "selected_device": selected_device,
         "selected_compute_type": selected_compute_type,
         "strict_cuda": strict_cuda,
+        "timestamp": _utcnow(),
+    }
+
+
+@router.get("/system/gpu")
+async def get_gpu_status(_token: str = Depends(require_auth)):
+    """
+    Structured GPU/runtime diagnostics. Requires auth.
+
+    Returns:
+        GPU availability, compute type, active jobs, Redis queue depths,
+        rolling processing duration statistics (from recently finished jobs).
+    """
+    # Worker health file (written by worker on startup)
+    worker_health_path = SESSIONS_DIR.parent / "worker_health.json"
+    gpu_info: dict = {}
+    if worker_health_path.exists():
+        try:
+            gpu_info = _read_json(worker_health_path)
+        except Exception:
+            pass
+
+    # Scan recent sessions for active jobs + collect timing data
+    active_jobs: List[dict] = []
+    completed_timings: List[float] = []
+    try:
+        if SESSIONS_DIR.exists():
+            # Sort by mtime desc, cap at 500 to avoid scanning huge session dirs
+            all_dirs = sorted(
+                (p for p in SESSIONS_DIR.iterdir() if p.is_dir()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:500]
+            for sd in all_dirs:
+                sp = sd / "status.json"
+                if not sp.exists():
+                    continue
+                try:
+                    s = _read_json(sp)
+                    status = s.get("status", "")
+                    if status in ("processing", "running"):
+                        active_jobs.append({
+                            "session_id": sd.name,
+                            "started_at": s.get("started_at"),
+                            "updated_at": s.get("updated_at"),
+                        })
+                    elif status == "done" and s.get("started_at") and s.get("finished_at"):
+                        try:
+                            t0 = datetime.fromisoformat(s["started_at"].rstrip("Z"))
+                            t1 = datetime.fromisoformat(s["finished_at"].rstrip("Z"))
+                            dur = (t1 - t0).total_seconds()
+                            if 0 < dur < 3600:
+                                completed_timings.append(dur)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Redis queue depths
+    queue_depth = 0
+    partial_queue_depth = 0
+    try:
+        r = _get_redis()
+        if r:
+            queue_depth = int(r.llen(REDIS_QUEUE) or 0)
+            partial_queue_depth = int(r.llen(REDIS_PARTIAL_QUEUE) or 0)
+    except Exception:
+        pass
+
+    # Rolling stats from up to 50 most recent completed jobs
+    recent = completed_timings[:50]
+    processing_stats: dict = {}
+    if recent:
+        srt = sorted(recent)
+        n = len(srt)
+        processing_stats = {
+            "count": n,
+            "avg_s": round(sum(srt) / n, 1),
+            "min_s": round(srt[0], 1),
+            "p50_s": round(srt[n // 2], 1),
+            "p95_s": round(srt[min(int(n * 0.95), n - 1)], 1),
+            "max_s": round(srt[-1], 1),
+        }
+
+    return {
+        "gpu_available": gpu_info.get("gpu_available", False),
+        "gpu_reason": gpu_info.get("gpu_reason"),
+        "selected_compute_type": gpu_info.get("selected_compute_type"),
+        "strict_cuda": gpu_info.get("strict_cuda"),
+        "worker_started_at": gpu_info.get("worker_started_at"),
+        "active_jobs": active_jobs,
+        "active_job_count": len(active_jobs),
+        "queue_depth": queue_depth,
+        "partial_queue_depth": partial_queue_depth,
+        "processing_stats": processing_stats,
         "timestamp": _utcnow(),
     }
 
@@ -262,6 +447,10 @@ async def create_session(request: Request, _token: str = Depends(require_auth)):
         "created_at": _utcnow(),
         "state": "created",
         "chunks": [],
+        # Timing fields (filled in as events occur)
+        "first_chunk_at": None,
+        "last_chunk_at": None,
+        "finalize_requested_at": None,
     }
 
     _write_json(d / "v2_session.json", session_data)
@@ -319,28 +508,53 @@ async def upload_chunk(
                 raise HTTPException(413, f"Chunk too large (max {MAX_CHUNK_MB} MB).")
             f.write(data)
 
+    now = _utcnow()
+
     # Update chunk registry (replace if same index)
     chunk_info = {
         "chunk_index": chunk_index,
         "chunk_started_ms": chunk_started_ms,
         "chunk_duration_ms": chunk_duration_ms,
         "bytes": bytes_written,
-        "uploaded_at": _utcnow(),
+        "uploaded_at": now,
     }
     chunks = [c for c in existing_chunks if c["chunk_index"] != chunk_index]
     chunks.append(chunk_info)
     chunks.sort(key=lambda c: c["chunk_index"])
     session_data["chunks"] = chunks
 
-    if is_final:
+    # Timing fields
+    if not session_data.get("first_chunk_at"):
+        session_data["first_chunk_at"] = now
+    session_data["last_chunk_at"] = now
+
+    # State machine: created → receiving
+    if session_data.get("state") == "created":
+        session_data["state"] = "receiving"
+
+    if is_final and session_data.get("state") == "receiving":
         session_data["state"] = "chunks_complete"
 
     _write_json(session_path, session_data)
+
+    # Trigger partial transcription every N chunks for stream sessions
+    total_chunks = len(chunks)
+    if (
+        session_data.get("mode", "stream") == "stream"
+        and PARTIAL_EVERY_N_CHUNKS > 0
+        and total_chunks % PARTIAL_EVERY_N_CHUNKS == 0
+        and session_data.get("state") in ("receiving", "chunks_complete", "partially_processed")
+    ):
+        try:
+            _trigger_partial(session_id, d, session_data)
+        except Exception as e:
+            print(f"[V2] Warning: partial trigger failed: {e}")
 
     return {
         "accepted": True,
         "session_id": session_id,
         "chunk_index": chunk_index,
+        "chunk_count": total_chunks,
         "status": "accepted",
     }
 
@@ -358,7 +572,8 @@ async def finalize_session(
         run_diarization  bool (default false)
         language         ISO code or "auto" (default "auto")
         model_size       "tiny"|"base"|"small"|"medium"|"large" (default "base")
-        merge_strategy   "timeline" (currently only option, reserved)
+        speaker_count    int (also accepted as num_speakers for Android compat)
+        merge_strategy   "timeline" (reserved)
     """
     try:
         body = await request.json()
@@ -372,7 +587,6 @@ async def finalize_session(
     state = session_data.get("state")
     if state == "finalized":
         # Idempotent: return existing job info
-        existing_status = _read_json(d / "status.json") if (d / "status.json").exists() else {}
         return {
             "session_id": session_id,
             "job_id": session_id,
@@ -403,13 +617,20 @@ async def finalize_session(
         raise HTTPException(500, f"Failed to merge audio chunks: {e}")
 
     # Build transcription options
+    # Accept num_speakers as alias for speaker_count (Android client field drift compat)
     language_raw: str = body.get("language", "auto")
     run_diarization: bool = bool(body.get("run_diarization", False))
     model_size: str = body.get("model_size", "base")
-    speaker_count: int = body.get("speaker_count", 2 if run_diarization else 1)
+    speaker_count: int = int(
+        body.get("speaker_count")
+        or body.get("num_speakers")
+        or (2 if run_diarization else 1)
+    )
 
     # "auto" → pass None to faster-whisper for language auto-detection
     language_for_worker = None if language_raw == "auto" else language_raw
+
+    now = _utcnow()
 
     # Write metadata.json (consumed by worker)
     metadata = {
@@ -430,24 +651,27 @@ async def finalize_session(
         {
             "status": "uploaded",
             "session_id": session_id,
+            "queued_at": now,
             "progress": {"upload": 100, "processing": 0, "stage": "queued"},
         },
     )
 
     # Update v2 session state
     session_data["state"] = "finalized"
-    session_data["finalized_at"] = _utcnow()
+    session_data["finalize_requested_at"] = now
+    if not session_data.get("finalized_at"):
+        session_data["finalized_at"] = now
     _write_json(session_path, session_data)
 
-    # Enqueue to Redis
-    # language_for_worker is None for auto-detect — do NOT coerce to "en" here.
+    # Enqueue to Redis — language_for_worker is None for auto-detect (never coerce to "en")
     job_data = {
         "session_id": session_id,
-        "language": language_for_worker,   # None → faster-whisper auto-detects
+        "language": language_for_worker,
         "speaker_count": speaker_count,
         "model_size": model_size,
         "timestamps": True,
         "job_type": "v2",
+        "queued_at": now,
     }
     r = _get_redis()
     if r:
@@ -472,6 +696,7 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
     Poll transcription job status.
 
     States: queued | running | done | error
+    progress: dict with keys {upload: 0-100, processing: 0-100, stage: str}
     """
     session_dir = SESSIONS_DIR / job_id
     if not session_dir.exists():
@@ -497,7 +722,6 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
     state = state_map.get(internal, "queued")
 
     progress_data = status_data.get("progress", {})
-    # Return progress object as-is so callers can read progress.processing (0-100) and progress.stage
     if not isinstance(progress_data, dict):
         progress_data = {}
 
@@ -512,7 +736,6 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
             except Exception:
                 error_obj = None
 
-        # Prefer detailed error message, but never leave message empty
         if error_obj and error_obj.get("error_message"):
             message = str(error_obj["error_message"])
         elif status_data.get("error"):
@@ -532,7 +755,6 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
         except Exception:
             pass
 
-    # Segment count + duration from result files (available only when done)
     if state == "done":
         tsp = session_dir / "transcript_timestamps.json"
         if tsp.exists():
@@ -557,8 +779,13 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
         "state": state,
         "progress": progress_data,
         "message": message,
-        "started_at": status_data.get("created_at"),
-        "finished_at": status_data.get("completed_at") or status_data.get("updated_at"),
+        "queued_at": status_data.get("queued_at"),
+        "started_at": status_data.get("started_at") or status_data.get("created_at"),
+        "finished_at": (
+            status_data.get("finished_at")
+            or status_data.get("completed_at")
+            or (status_data.get("updated_at") if state in ("done", "error") else None)
+        ),
         "meta": meta,
     }
 
@@ -590,6 +817,96 @@ async def get_job_error(job_id: str, _token: str = Depends(require_auth)):
         raise HTTPException(404, "Error details not available for this job.")
 
     return _read_json(error_path)
+
+
+@router.get("/sessions/{session_id}/status")
+async def get_session_status(session_id: str, _token: str = Depends(require_auth)):
+    """
+    Rich session status combining v2_session.json + status.json.
+
+    Covers the full state machine including pre-finalization states
+    (created / receiving / partially_processed) that /jobs/{id} doesn't expose.
+
+    Returns:
+        session_id, state, chunk_count, total_audio_ms,
+        partial_transcript_available, timing fields, worker progress.
+    """
+    d = _require_v2_session(session_id)
+
+    session_data = _read_json(d / "v2_session.json")
+    status_data: dict = {}
+    if (d / "status.json").exists():
+        try:
+            status_data = _read_json(d / "status.json")
+        except Exception:
+            pass
+
+    state = _derive_session_state(session_data, status_data)
+    partial_available = (d / "partial_transcript.json").exists()
+
+    chunks = session_data.get("chunks", [])
+    total_duration_ms = sum(c.get("chunk_duration_ms", 0) for c in chunks)
+
+    return {
+        "session_id": session_id,
+        "state": state,
+        "chunk_count": len(chunks),
+        "total_audio_ms": total_duration_ms,
+        "partial_transcript_available": partial_available,
+        # Timing
+        "created_at": session_data.get("created_at"),
+        "first_chunk_at": session_data.get("first_chunk_at"),
+        "last_chunk_at": session_data.get("last_chunk_at"),
+        "finalize_requested_at": session_data.get("finalize_requested_at"),
+        "queued_at": status_data.get("queued_at"),
+        "started_at": status_data.get("started_at"),
+        "finished_at": status_data.get("finished_at"),
+        # Worker progress (populated during / after transcription)
+        "progress": status_data.get("progress", {}),
+        "mode": session_data.get("mode", "stream"),
+        "device_id": session_data.get("device_id"),
+    }
+
+
+@router.get("/sessions/{session_id}/transcript/partial")
+async def get_partial_transcript(session_id: str, _token: str = Depends(require_auth)):
+    """
+    Get the latest provisional partial transcript for a live recording session.
+
+    Available once at least one partial transcription has been processed
+    (state: partially_processed or later). Marked provisional=true.
+
+    Returns 404 if no partial transcript is available yet.
+    The final authoritative transcript is at /sessions/{id}/transcript.
+    """
+    d = _require_v2_session(session_id)
+
+    partial_path = d / "partial_transcript.json"
+    if not partial_path.exists():
+        raise HTTPException(
+            404,
+            detail={
+                "message": "No partial transcript available yet.",
+                "hint": (
+                    f"Partial transcripts are generated every {PARTIAL_EVERY_N_CHUNKS} chunks "
+                    "for stream-mode sessions. Upload more chunks or wait for the worker."
+                ),
+            },
+        )
+
+    try:
+        partial = _read_json(partial_path)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to read partial transcript: {e}")
+
+    return {
+        "session_id": session_id,
+        "provisional": True,
+        "text": partial.get("text", ""),
+        "segments": partial.get("segments", []),
+        "chunk_count_at_time": partial.get("chunk_count_at_time", 0),
+        "generated_at": partial.get("generated_at"),
+    }
 
 
 @router.get("/sessions/{session_id}/transcript")
@@ -641,13 +958,12 @@ async def get_transcript(session_id: str, _token: str = Depends(require_auth)):
     tsp = d / "transcript_timestamps.json"
     if tsp.exists():
         ts_data = json.loads(tsp.read_text(encoding="utf-8"))
-        # Check if word-level tokens exist inside each segment
         for seg in ts_data:
             for w in seg.get("words", []):
                 words.append(
                     {
                         "t_ms": int(w.get("start", seg.get("start", 0)) * 1000),
-                        "speaker": "SPEAKER_00",  # will be overridden below if diarization available
+                        "speaker": "SPEAKER_00",
                         "w": w.get("word", "").strip(),
                     }
                 )
