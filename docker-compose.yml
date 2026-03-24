@@ -28,6 +28,18 @@ services:
       - REDIS_QUEUE=transcription_jobs
       - AUTH_TOKEN=${AUTH_TOKEN}
       - AUTH_QUERY_PARAM=${AUTH_QUERY_PARAM:-token}
+      - MAX_CHUNK_MB=${MAX_CHUNK_MB:-30}
+      - MAX_SESSION_CHUNKS=${MAX_SESSION_CHUNKS:-500}
+      # Default Whisper model for full transcription jobs when client does not specify one.
+      # Falls back to WHISPER_MODEL, then "small". Partial previews always use "base".
+      - WHISPER_MODEL_FULL=${WHISPER_MODEL_FULL:-small}
+      - WHISPER_MODEL=${WHISPER_MODEL:-small}
+      # Partial transcription cooldown — minimum seconds between partial triggers per session.
+      # Prevents GPU abuse during backlog catch-up uploads. 0 = no cooldown.
+      - PARTIAL_COOLDOWN_SECONDS=${PARTIAL_COOLDOWN_SECONDS:-120}
+      # Rate limiting — upload bucket is separate and higher than general API
+      - RATE_LIMIT_GENERAL_PER_MINUTE=${RATE_LIMIT_GENERAL_PER_MINUTE:-60}
+      - RATE_LIMIT_UPLOAD_PER_MINUTE=${RATE_LIMIT_UPLOAD_PER_MINUTE:-300}
     depends_on:
       redis:
         condition: service_healthy
@@ -63,6 +75,13 @@ services:
       - TRANSFORMERS_CACHE=/models
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # Transcript classification (local LLM, optional)
+      # Set CLASSIFIER_MODEL_PATH to a .gguf file in /models to enable.
+      # Runs on CPU by default (n_gpu_layers=0) to avoid Whisper VRAM contention.
+      - CLASSIFIER_ENABLED=${CLASSIFIER_ENABLED:-1}
+      - CLASSIFIER_MODEL_PATH=${CLASSIFIER_MODEL_PATH:-}
+      - CLASSIFIER_N_GPU_LAYERS=${CLASSIFIER_N_GPU_LAYERS:-0}
+      - CLASSIFIER_CONTEXT_SIZE=${CLASSIFIER_CONTEXT_SIZE:-2048}
     depends_on:
       redis:
         condition: service_healthy

@@ -14,6 +14,7 @@ Transcript artifacts written per session:
   clean_transcript.json       — reading-oriented clean text + paragraphs
   clean_transcript.txt        — clean text as plain text (quick access)
   quality_report.json         — structured quality analysis
+  classification.json         — LLM-based transcript category (optional)
   transcript_timestamps.json  — segments with start/end in seconds
   transcript_by_speaker.json  — aligned diarization segments
 """
@@ -35,6 +36,7 @@ from diarization import perform_diarization, align_diarization_with_transcript
 from audio_preprocess import preprocess_audio
 from transcript_quality import analyze_transcript_quality
 from clean_transcript import build_clean_transcript
+from transcript_classifier import classify_transcript
 
 # Configuration
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
@@ -116,6 +118,44 @@ def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
         os.fsync(f.fileno())
 
     os.replace(tmp_path, path)
+
+
+def _measure_wav_duration(path: Path) -> Optional[float]:
+    """Return duration in seconds of a WAV file, or None on error."""
+    try:
+        with wave.open(str(path), "rb") as w:
+            frames = w.getnframes()
+            rate = w.getframerate()
+            if rate > 0:
+                return round(frames / rate, 2)
+    except Exception:
+        pass
+    return None
+
+
+def _measure_wav_info(path: Path) -> Dict[str, Any]:
+    """Return WAV file info: duration_s, channels, sample_rate, byte_size."""
+    info: Dict[str, Any] = {
+        "duration_s": None,
+        "channels": None,
+        "sample_rate": None,
+        "byte_size": None,
+    }
+    try:
+        info["byte_size"] = path.stat().st_size
+    except Exception:
+        pass
+    try:
+        with wave.open(str(path), "rb") as w:
+            frames = w.getnframes()
+            rate = w.getframerate()
+            info["channels"] = w.getnchannels()
+            info["sample_rate"] = rate
+            if rate > 0:
+                info["duration_s"] = round(frames / rate, 2)
+    except Exception:
+        pass
+    return info
 
 
 def update_session_status(
@@ -496,7 +536,14 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
     session_dir = SESSIONS_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[{session_id}] Starting transcription job")
+    is_retry = bool(job_data.get("retry"))
+    print(
+        f"[LIFECYCLE] [{session_id}] Job received — "
+        f"model={job_data.get('model_size', '?')} "
+        f"speakers={job_data.get('speaker_count', '?')} "
+        f"lang={job_data.get('language') or 'auto'} "
+        f"retry={is_retry}"
+    )
 
     status_path = session_dir / "status.json"
 
@@ -504,15 +551,16 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
         # Idempotency: skip if already done
         existing_status = _safe_read_json(status_path)
         if existing_status.get("status") == STATUS_DONE:
-            print(f"[{session_id}] Already processed, skipping")
+            print(f"[LIFECYCLE] [{session_id}] Already processed (status=done), skipping")
             return
 
         if existing_status.get("status") == STATUS_CANCELLED:
-            print(f"[{session_id}] Job cancelled, skipping")
+            print(f"[LIFECYCLE] [{session_id}] Job cancelled, skipping")
             return
 
         # Set running (records started_at automatically)
         update_session_status(session_id, STATUS_RUNNING)
+        print(f"[LIFECYCLE] [{session_id}] Status → running")
 
         metadata_path = session_dir / "metadata.json"
         metadata = _safe_read_json(metadata_path)
@@ -521,13 +569,46 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
+        # ---- Measure actual audio file before any processing ----
+        audio_info = _measure_wav_info(audio_path)
+        audio_duration_s = audio_info["duration_s"]
+        print(
+            f"[AUDIO-VERIFY] [{session_id}] FULL job — "
+            f"path={audio_path} "
+            f"bytes={audio_info['byte_size']} "
+            f"duration_s={audio_duration_s} "
+            f"channels={audio_info['channels']} "
+            f"sample_rate={audio_info['sample_rate']}"
+        )
+
         # None → faster-whisper auto-detects language; never fall back to "en" by default.
         language = job_data.get("language") or metadata.get("language") or None
         speaker_count = int(job_data.get("speaker_count", metadata.get("speaker_count", 1)))
-        model_size = job_data.get("model_size", metadata.get("model_size", "base"))
+        # Full-job model default: respect WHISPER_MODEL env (via transcription.DEFAULT_MODEL),
+        # which is "small" in docker-compose.  Client-explicit model_size still wins.
+        from transcription import DEFAULT_MODEL as _DEFAULT_WHISPER_MODEL
+        model_size = job_data.get("model_size") or metadata.get("model_size") or _DEFAULT_WHISPER_MODEL
         timestamps_enabled = bool(job_data.get("timestamps", metadata.get("timestamps", True)))
 
-        diarization_enabled = speaker_count > 1
+        # Diarization: use explicit flag from job/metadata, fall back to speaker_count heuristic.
+        diarization_enabled = bool(
+            job_data.get("diarization_enabled",
+                         metadata.get("diarization_enabled", False))
+        ) or speaker_count > 1
+
+        # Safety: if diarization is enabled but speaker_count < 2, force to 2
+        if diarization_enabled and speaker_count < 2:
+            print(
+                f"[{session_id}] Diarization enabled but speaker_count={speaker_count} "
+                f"— forcing speaker_count=2"
+            )
+            speaker_count = 2
+
+        print(
+            f"[{session_id}] Resolved: diarization={diarization_enabled} "
+            f"speaker_count={speaker_count} model={model_size} "
+            f"lang={language or 'auto'}"
+        )
 
         update_progress(session_id, "loading_model", 10)
 
@@ -559,10 +640,19 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
                 print(f"[{session_id}] Diarization failed: {e} — continuing without diarization")
                 diarization_segments = []
 
+        # ---- Pre-Whisper verification ----
+        print(
+            f"[WHISPER-INPUT] [{session_id}] Sending to Whisper: "
+            f"path={audio_path} "
+            f"file_size={audio_info['byte_size']} "
+            f"measured_duration_s={audio_duration_s} "
+            f"job_type=full"
+        )
+
         # Transcribe — segment_callback fires every 5 segments with the last 2
         # so the API can expose a live partial_preview via status.json
         update_progress(session_id, "transcribing", 15)
-        transcript, timestamps = transcribe_audio(
+        transcript, timestamps, detection_info = transcribe_audio(
             str(audio_path),
             language=language,
             diarization_enabled=diarization_enabled,
@@ -572,6 +662,42 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
             progress_callback=lambda p: update_progress(session_id, "transcribing", min(74, 15 + int(p * 0.65))),
             segment_callback=lambda segs: write_partial_preview(session_id, segs),
         )
+
+        # Persist language detection info for observability
+        if detection_info:
+            print(
+                f"[{session_id}] Language detection: "
+                f"detected={detection_info.get('detected_language')} "
+                f"prob={detection_info.get('language_probability')} "
+                f"requested={detection_info.get('requested_language') or 'auto'}"
+            )
+
+        # ---- Post-Whisper coverage verification ----
+        transcript_last_end_s = 0.0
+        if timestamps:
+            transcript_last_end_s = max(s.get("end", 0) for s in timestamps)
+
+        coverage_ratio = None
+        coverage_warning = None
+        if audio_duration_s and audio_duration_s > 0:
+            coverage_ratio = round(transcript_last_end_s / audio_duration_s, 3)
+            if coverage_ratio < 0.5:
+                coverage_warning = (
+                    f"Transcript covers only {coverage_ratio:.1%} of audio "
+                    f"({transcript_last_end_s:.1f}s / {audio_duration_s:.1f}s)"
+                )
+                print(
+                    f"[COVERAGE-WARNING] [{session_id}] {coverage_warning}"
+                )
+
+        print(
+            f"[WHISPER-OUTPUT] [{session_id}] "
+            f"segment_count={len(timestamps)} "
+            f"transcript_last_end_s={transcript_last_end_s:.1f} "
+            f"audio_duration_s={audio_duration_s} "
+            f"coverage_ratio={coverage_ratio}"
+        )
+
         update_progress(session_id, "aligning", 75)
 
         aligned_segments = []
@@ -688,17 +814,78 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
         except Exception as ce:
             print(f"[{session_id}] Clean transcript generation failed (non-fatal): {ce}")
 
+        # ----------------------------------------------------------------
+        # Classification — local LLM categorization of transcript content.
+        # Runs on CPU by default (no GPU contention with Whisper).
+        # Non-critical: failure here does NOT prevent job completion.
+        # ----------------------------------------------------------------
+        try:
+            classification = classify_transcript(transcript)
+            if classification is not None:
+                _atomic_write_json(session_dir / "classification.json", classification)
+                clf_status = classification.get("status", "unknown")
+                if clf_status == "success":
+                    print(
+                        f"[{session_id}] Classification: "
+                        f"category={classification.get('category')} "
+                        f"confidence={classification.get('confidence')}"
+                    )
+                else:
+                    reason = (
+                        classification.get("skip_reason")
+                        or classification.get("failure_reason")
+                        or "unknown"
+                    )
+                    print(f"[{session_id}] Classification {clf_status}: {reason}")
+            else:
+                print(f"[{session_id}] Classification skipped (not configured)")
+        except Exception as clf_err:
+            print(f"[{session_id}] Classification failed (non-fatal): {clf_err}")
+
+        # ----------------------------------------------------------------
+        # Coverage metadata — write truthful audio/transcript coverage info
+        # so the API can expose it and clients know if something is off.
+        # ----------------------------------------------------------------
+        coverage_meta = {
+            "audio_duration_s": audio_duration_s,
+            "transcript_last_end_s": round(transcript_last_end_s, 2),
+            "transcript_coverage_ratio": coverage_ratio,
+            "coverage_warning": coverage_warning,
+            "diarization_enabled": diarization_enabled,
+            "diarization_segments": len(diarization_segments),
+            "speaker_count_requested": speaker_count,
+            # Language detection observability
+            "detected_language": detection_info.get("detected_language") if detection_info else None,
+            "language_probability": detection_info.get("language_probability") if detection_info else None,
+            "requested_language": detection_info.get("requested_language") if detection_info else None,
+            "model_size": model_size,
+        }
+        _atomic_write_json(session_dir / "coverage_meta.json", coverage_meta)
+
         # Done (records finished_at automatically)
         update_session_status(
             session_id,
             STATUS_DONE,
             progress={"upload": 100, "processing": 100, "stage": "completed"}
         )
-        print(f"[{session_id}] Transcription completed successfully")
+
+        # Lifecycle summary — gives enough data for Android reconciliation debugging.
+        # If Android still shows "error" after this, the problem is client-side.
+        transcript_exists = (session_dir / "transcript.txt").exists()
+        seg_count = len(aligned_segments) if aligned_segments else len(timestamps)
+        word_count = len(transcript.split()) if transcript else 0
+        print(
+            f"[LIFECYCLE] [{session_id}] Status → done | "
+            f"transcript_on_disk={transcript_exists} "
+            f"segments={seg_count} words={word_count} "
+            f"audio_duration_s={audio_duration_s} "
+            f"transcript_last_end_s={transcript_last_end_s:.1f} "
+            f"coverage_ratio={coverage_ratio} "
+            f"retry={is_retry}"
+        )
 
     except Exception as e:
         error_msg = str(e)
-        print(f"[{session_id}] Transcription error: {error_msg}")
         tb_str = traceback.format_exc()
         traceback.print_exc()
 
@@ -718,6 +905,10 @@ def process_transcription_job(job_data: Dict[str, Any]) -> None:
             STATUS_ERROR,
             error=error_msg,
             progress={"upload": 100, "processing": 0, "stage": "error"}
+        )
+        print(
+            f"[LIFECYCLE] [{session_id}] Status → error | "
+            f"type={type(e).__name__} msg={error_msg[:200]}"
         )
 
 
@@ -766,12 +957,23 @@ def process_partial_job(job_data: Dict[str, Any]) -> None:
         partial_audio = session_dir / "audio_partial.wav"
         _merge_chunks_to_path(chunk_paths, partial_audio)
 
+        # Partial merge instrumentation
+        partial_info = _measure_wav_info(partial_audio)
+        print(
+            f"[AUDIO-VERIFY] [{session_id}] PARTIAL job — "
+            f"path={partial_audio} "
+            f"bytes={partial_info['byte_size']} "
+            f"duration_s={partial_info['duration_s']} "
+            f"chunks_merged={len(chunk_paths)}/{len(chunks)} "
+            f"job_type=partial"
+        )
+
         # Transcription params (best-effort from metadata or job_data)
         metadata = _safe_read_json(session_dir / "metadata.json")
         language = job_data.get("language") or metadata.get("language") or None
         model_size = job_data.get("model_size") or metadata.get("model_size") or "base"
 
-        transcript, timestamps = transcribe_audio(
+        transcript, timestamps, _partial_detection = transcribe_audio(
             str(partial_audio),
             language=language,
             model_size=model_size,

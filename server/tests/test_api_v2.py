@@ -1555,3 +1555,725 @@ class TestContinuityMetadata:
             )
         finally:
             requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# TestReconciliationFields
+# ---------------------------------------------------------------------------
+
+class TestReconciliationFields:
+    """
+    Verify that job and session status endpoints expose the new reconciliation
+    fields: backend_outcome, transcript_present, failure_category.
+
+    These fields are the stable truth source for Android to distinguish
+    "backend done" from "Android local integrity warning".
+    """
+
+    @pytest.fixture(scope="class")
+    def done_session(self, base_url, auth_headers):
+        """Create + finalize a session and wait for done."""
+        wav_bytes = make_wav_bytes(duration_s=2.0)
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:RECON:01"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200
+        sid = r.json()["session_id"]
+        for i in range(2):
+            requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/chunks",
+                headers=auth_headers,
+                files={"file": (f"c{i}.wav", wav_bytes, "audio/wav")},
+                data={"chunk_index": str(i), "chunk_duration_ms": "2000"},
+                timeout=30,
+            )
+        requests.post(
+            f"{base_url}/api/v2/sessions/{sid}/finalize",
+            json={"language": "en", "model_size": "tiny"},
+            headers=auth_headers,
+            timeout=30,
+        )
+        deadline = time.time() + 120
+        state = "queued"
+        while time.time() < deadline:
+            time.sleep(3)
+            rj = requests.get(
+                f"{base_url}/api/v2/jobs/{sid}",
+                headers=auth_headers,
+                timeout=10,
+            )
+            state = rj.json().get("state", state)
+            if state in ("done", "error"):
+                break
+        yield {"session_id": sid, "state": state}
+        requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    # ----- Job status reconciliation fields -----
+
+    def test_job_status_has_backend_outcome(self, base_url, auth_headers, done_session):
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/jobs/{done_session['session_id']}",
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "backend_outcome" in data, "backend_outcome missing from job status"
+        assert data["backend_outcome"] == "completed", (
+            f"Expected backend_outcome='completed' for done job, got '{data['backend_outcome']}'"
+        )
+
+    def test_job_status_has_transcript_present(self, base_url, auth_headers, done_session):
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/jobs/{done_session['session_id']}",
+            headers=auth_headers,
+            timeout=10,
+        )
+        data = r.json()
+        assert "transcript_present" in data, "transcript_present missing from job status"
+        assert data["transcript_present"] is True, (
+            "transcript_present should be True for a completed job"
+        )
+
+    def test_job_status_failure_category_null_when_done(self, base_url, auth_headers, done_session):
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/jobs/{done_session['session_id']}",
+            headers=auth_headers,
+            timeout=10,
+        )
+        data = r.json()
+        assert "failure_category" in data, "failure_category missing from job status"
+        assert data["failure_category"] is None, (
+            "failure_category must be null for a completed job"
+        )
+
+    def test_job_status_has_partial_transcript_available(self, base_url, auth_headers, done_session):
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/jobs/{done_session['session_id']}",
+            headers=auth_headers,
+            timeout=10,
+        )
+        data = r.json()
+        assert "partial_transcript_available" in data, (
+            "partial_transcript_available missing from job status"
+        )
+        assert isinstance(data["partial_transcript_available"], bool)
+
+    # ----- Session status reconciliation fields -----
+
+    def test_session_status_has_backend_outcome(self, base_url, auth_headers, done_session):
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{done_session['session_id']}/status",
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "backend_outcome" in data, "backend_outcome missing from session status"
+        assert data["backend_outcome"] == "completed"
+
+    def test_session_status_has_transcript_present(self, base_url, auth_headers, done_session):
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{done_session['session_id']}/status",
+            headers=auth_headers,
+            timeout=10,
+        )
+        data = r.json()
+        assert "transcript_present" in data, "transcript_present missing from session status"
+        assert data["transcript_present"] is True
+
+    def test_session_status_error_message_null_when_done(self, base_url, auth_headers, done_session):
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{done_session['session_id']}/status",
+            headers=auth_headers,
+            timeout=10,
+        )
+        data = r.json()
+        assert "error_message" in data, "error_message missing from session status"
+        assert data["error_message"] is None, (
+            "error_message must be null for a completed session"
+        )
+
+    # ----- Queued session (pre-worker) -----
+
+    def test_queued_session_backend_outcome(self, base_url, auth_headers):
+        """A freshly-finalized session (before worker picks it up) should show queued."""
+        wav_bytes = make_wav_bytes(duration_s=0.5)
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:RECON:Q"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+        try:
+            requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/chunks",
+                headers=auth_headers,
+                files={"file": ("c0.wav", wav_bytes, "audio/wav")},
+                data={"chunk_index": "0"},
+                timeout=15,
+            )
+            requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/finalize",
+                json={"model_size": "tiny"},
+                headers=auth_headers,
+                timeout=10,
+            )
+            # Immediately check — likely still queued
+            rj = requests.get(
+                f"{base_url}/api/v2/jobs/{sid}",
+                headers=auth_headers,
+                timeout=10,
+            )
+            data = rj.json()
+            assert "backend_outcome" in data
+            # Could be queued or already processing — both are valid
+            assert data["backend_outcome"] in ("queued", "processing", "completed")
+        finally:
+            # Wait a moment for worker then clean up
+            time.sleep(2)
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    # ----- Not-started session -----
+
+    def test_not_started_session_backend_outcome(self, base_url, auth_headers):
+        """A session that was created but never finalized should show not_started."""
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:RECON:NS"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+        try:
+            rs = requests.get(
+                f"{base_url}/api/v2/sessions/{sid}/status",
+                headers=auth_headers,
+                timeout=10,
+            )
+            data = rs.json()
+            assert data["backend_outcome"] == "not_started"
+            assert data["transcript_present"] is False
+        finally:
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# TestRetryEndpoint
+# ---------------------------------------------------------------------------
+
+class TestRetryEndpoint:
+    """
+    Verify POST /sessions/{id}/retry — explicit re-enqueue for failed or stuck jobs.
+    """
+
+    def _make_wav_bytes(self) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 160)
+        return buf.getvalue()
+
+    def _create_and_finalize(self, base_url, auth_headers):
+        wav = self._make_wav_bytes()
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:RETRY:01"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+        requests.post(
+            f"{base_url}/api/v2/sessions/{sid}/chunks",
+            headers=auth_headers,
+            files={"file": ("c0.wav", wav, "audio/wav")},
+            data={"chunk_index": "0"},
+            timeout=15,
+        )
+        requests.post(
+            f"{base_url}/api/v2/sessions/{sid}/finalize",
+            json={"model_size": "tiny"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        return sid
+
+    def test_retry_not_finalized_returns_409(self, base_url, auth_headers):
+        """Retry on a session that hasn't been finalized yet should fail."""
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:RETRY:NF"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+        try:
+            rr = requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/retry",
+                headers=auth_headers,
+                timeout=10,
+            )
+            assert rr.status_code == 409, (
+                f"Expected 409 for non-finalized retry, got {rr.status_code}"
+            )
+        finally:
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    def test_retry_done_session_returns_409(self, base_url, auth_headers):
+        """Retry on a successfully completed session should fail (nothing to retry)."""
+        sid = self._create_and_finalize(base_url, auth_headers)
+        try:
+            # Wait for job to complete
+            deadline = time.time() + 120
+            state = "queued"
+            while time.time() < deadline:
+                time.sleep(3)
+                rj = requests.get(
+                    f"{base_url}/api/v2/jobs/{sid}",
+                    headers=auth_headers,
+                    timeout=10,
+                )
+                state = rj.json().get("state", state)
+                if state in ("done", "error"):
+                    break
+
+            if state != "done":
+                pytest.skip(f"Job did not complete (state={state})")
+
+            rr = requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/retry",
+                headers=auth_headers,
+                timeout=10,
+            )
+            assert rr.status_code == 409, (
+                f"Expected 409 for retry on done session, got {rr.status_code}"
+            )
+        finally:
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    def test_retry_endpoint_exists(self, base_url, auth_headers):
+        """The retry endpoint must return a valid status code (not 404/405)."""
+        sid = self._create_and_finalize(base_url, auth_headers)
+        try:
+            # Wait briefly for worker to potentially pick it up
+            time.sleep(5)
+            rr = requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/retry",
+                headers=auth_headers,
+                timeout=10,
+            )
+            # Could be 200 (retried) or 409 (already done/running) — both are valid
+            assert rr.status_code in (200, 409), (
+                f"Unexpected status from retry endpoint: {rr.status_code} {rr.text}"
+            )
+        finally:
+            time.sleep(2)
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# TestFinalizeIdempotentRequeue
+# ---------------------------------------------------------------------------
+
+class TestFinalizeIdempotentRequeue:
+    """
+    Verify that calling finalize twice returns an idempotent response and
+    includes the requeued field.
+    """
+
+    def _make_wav_bytes(self) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 160)
+        return buf.getvalue()
+
+    def test_double_finalize_returns_200_with_requeued_field(self, base_url, auth_headers):
+        """Second finalize call should return 200 with a requeued boolean field."""
+        wav = self._make_wav_bytes()
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:IDEM:01"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+        try:
+            requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/chunks",
+                headers=auth_headers,
+                files={"file": ("c0.wav", wav, "audio/wav")},
+                data={"chunk_index": "0"},
+                timeout=15,
+            )
+            # First finalize
+            r1 = requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/finalize",
+                json={"model_size": "tiny"},
+                headers=auth_headers,
+                timeout=10,
+            )
+            assert r1.status_code == 200
+
+            # Second finalize — idempotent
+            r2 = requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/finalize",
+                json={"model_size": "tiny"},
+                headers=auth_headers,
+                timeout=10,
+            )
+            assert r2.status_code == 200
+            data = r2.json()
+            assert "requeued" in data, "Idempotent finalize must include 'requeued' field"
+            assert isinstance(data["requeued"], bool)
+            assert data["job_id"] == sid
+        finally:
+            time.sleep(2)
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    def test_finalize_enqueued_field_present(self, base_url, auth_headers):
+        """First finalize should return the enqueued boolean field."""
+        wav = self._make_wav_bytes()
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:ENQ:01"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+        try:
+            requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/chunks",
+                headers=auth_headers,
+                files={"file": ("c0.wav", wav, "audio/wav")},
+                data={"chunk_index": "0"},
+                timeout=15,
+            )
+            r1 = requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/finalize",
+                json={"model_size": "tiny"},
+                headers=auth_headers,
+                timeout=10,
+            )
+            assert r1.status_code == 200
+            data = r1.json()
+            assert "enqueued" in data, "First finalize must include 'enqueued' field"
+            assert data["enqueued"] is True, "enqueued should be True when Redis is available"
+        finally:
+            time.sleep(2)
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# TestClassificationField
+# ---------------------------------------------------------------------------
+
+class TestClassificationField:
+    """
+    Verify that the transcript response includes the classification field
+    (null when classifier is not configured, structured dict when available).
+    Backward-compatible: existing clients ignoring classification are unaffected.
+    """
+
+    @pytest.fixture(scope="class")
+    def done_session(self, base_url, auth_headers):
+        wav_bytes = make_wav_bytes(duration_s=2.0)
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:CLF:01"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200
+        sid = r.json()["session_id"]
+        for i in range(2):
+            requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/chunks",
+                headers=auth_headers,
+                files={"file": (f"c{i}.wav", wav_bytes, "audio/wav")},
+                data={"chunk_index": str(i), "chunk_duration_ms": "2000"},
+                timeout=30,
+            )
+        requests.post(
+            f"{base_url}/api/v2/sessions/{sid}/finalize",
+            json={"language": "en", "model_size": "tiny"},
+            headers=auth_headers,
+            timeout=30,
+        )
+        deadline = time.time() + 120
+        state = "queued"
+        while time.time() < deadline:
+            time.sleep(3)
+            rj = requests.get(
+                f"{base_url}/api/v2/jobs/{sid}",
+                headers=auth_headers,
+                timeout=10,
+            )
+            state = rj.json().get("state", state)
+            if state in ("done", "error"):
+                break
+        yield {"session_id": sid, "state": state}
+        requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    def test_classification_key_present_in_transcript(self, base_url, auth_headers, done_session):
+        """classification key must exist in transcript response (may be null)."""
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{done_session['session_id']}/transcript",
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "classification" in data, "classification field missing from transcript response"
+
+    def test_classification_structure_when_present(self, base_url, auth_headers, done_session):
+        """If classification is non-null, it must have category, confidence, rationale."""
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{done_session['session_id']}/transcript",
+            headers=auth_headers,
+            timeout=10,
+        )
+        data = r.json()
+        clf = data.get("classification")
+        if clf is None:
+            pytest.skip("Classification is null (classifier not configured on server)")
+        assert "category" in clf, "classification missing 'category'"
+        assert clf["category"] in ("meeting", "technical", "self_reflection", "self_therapy"), (
+            f"Unknown classification category: {clf['category']}"
+        )
+        assert "confidence" in clf, "classification missing 'confidence'"
+        assert isinstance(clf["confidence"], (int, float))
+        assert 0.0 <= clf["confidence"] <= 1.0
+        assert "rationale" in clf, "classification missing 'rationale'"
+
+    def test_classification_in_job_meta_when_done(self, base_url, auth_headers, done_session):
+        """Job status meta should include classification category if available."""
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/jobs/{done_session['session_id']}",
+            headers=auth_headers,
+            timeout=10,
+        )
+        data = r.json()
+        meta = data.get("meta", {})
+        # These fields are optional — present only if classifier ran
+        if "classification" in meta:
+            assert meta["classification"] in (
+                "meeting", "technical", "self_reflection", "self_therapy",
+            )
+            assert "classification_confidence" in meta
+
+    def test_text_and_segments_still_present(self, base_url, auth_headers, done_session):
+        """Existing text/segments fields must still be present (backward compat)."""
+        if done_session["state"] != "done":
+            pytest.skip(f"Job not done (state={done_session['state']})")
+        r = requests.get(
+            f"{base_url}/api/v2/sessions/{done_session['session_id']}/transcript",
+            headers=auth_headers,
+            timeout=10,
+        )
+        data = r.json()
+        assert "text" in data
+        assert "segments" in data
+
+
+# ---------------------------------------------------------------------------
+# TestDiarizationBackwardCompat
+# ---------------------------------------------------------------------------
+
+class TestDiarizationBackwardCompat:
+    """
+    Verify that finalize accepts both run_diarization (current) and
+    diarization (legacy) field names.
+    """
+
+    def _make_wav_bytes(self) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 160)
+        return buf.getvalue()
+
+    def _create_with_chunk(self, base_url, auth_headers):
+        wav = self._make_wav_bytes()
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:DIAR:01"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+        requests.post(
+            f"{base_url}/api/v2/sessions/{sid}/chunks",
+            headers=auth_headers,
+            files={"file": ("c0.wav", wav, "audio/wav")},
+            data={"chunk_index": "0"},
+            timeout=15,
+        )
+        return sid
+
+    def test_finalize_accepts_run_diarization(self, base_url, auth_headers):
+        """Current field name run_diarization must be accepted."""
+        sid = self._create_with_chunk(base_url, auth_headers)
+        try:
+            r = requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/finalize",
+                json={"model_size": "tiny", "run_diarization": True},
+                headers=auth_headers,
+                timeout=10,
+            )
+            assert r.status_code == 200, (
+                f"run_diarization=true rejected: {r.status_code} {r.text}"
+            )
+        finally:
+            time.sleep(2)
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    def test_finalize_accepts_legacy_diarization(self, base_url, auth_headers):
+        """Legacy field name diarization must also be accepted."""
+        sid = self._create_with_chunk(base_url, auth_headers)
+        try:
+            r = requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/finalize",
+                json={"model_size": "tiny", "diarization": True},
+                headers=auth_headers,
+                timeout=10,
+            )
+            assert r.status_code == 200, (
+                f"legacy diarization=true rejected: {r.status_code} {r.text}"
+            )
+        finally:
+            time.sleep(2)
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    def test_finalize_accepts_no_diarization_field(self, base_url, auth_headers):
+        """Omitting both diarization fields should default to false."""
+        sid = self._create_with_chunk(base_url, auth_headers)
+        try:
+            r = requests.post(
+                f"{base_url}/api/v2/sessions/{sid}/finalize",
+                json={"model_size": "tiny"},
+                headers=auth_headers,
+                timeout=10,
+            )
+            assert r.status_code == 200
+        finally:
+            time.sleep(2)
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# TestUploadRateLimitResponse
+# ---------------------------------------------------------------------------
+
+class TestUploadRateLimitResponse:
+    """
+    Verify that chunk upload uses the upload-specific rate limiter and
+    returns a structured 429 response when hit.
+
+    NOTE: These tests are best-effort — they may not trigger a real 429
+    if the server's upload limit is very high. The unit tests in
+    test_rate_limiter.py cover the limiter logic exhaustively.
+    """
+
+    def test_chunk_upload_succeeds_under_normal_load(self, base_url, auth_headers):
+        """A small number of chunk uploads should never trigger rate limiting."""
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:RATE:01"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+        try:
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(b"\x00\x00" * 160)
+            wav = buf.getvalue()
+
+            # Upload a few chunks — should all succeed
+            for i in range(5):
+                ru = requests.post(
+                    f"{base_url}/api/v2/sessions/{sid}/chunks",
+                    headers=auth_headers,
+                    files={"file": (f"c{i}.wav", wav, "audio/wav")},
+                    data={"chunk_index": str(i)},
+                    timeout=15,
+                )
+                assert ru.status_code == 200, (
+                    f"Chunk {i} rejected unexpectedly: {ru.status_code} {ru.text}"
+                )
+        finally:
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)
+
+    def test_general_api_not_affected_by_upload_traffic(self, base_url, auth_headers):
+        """Polling job status should work even after many chunk uploads."""
+        r = requests.post(
+            f"{base_url}/api/v2/sessions",
+            json={"device_id": "TEST:RATE:02"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        sid = r.json()["session_id"]
+        try:
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(b"\x00\x00" * 160)
+            wav = buf.getvalue()
+
+            # Upload several chunks
+            for i in range(10):
+                requests.post(
+                    f"{base_url}/api/v2/sessions/{sid}/chunks",
+                    headers=auth_headers,
+                    files={"file": (f"c{i}.wav", wav, "audio/wav")},
+                    data={"chunk_index": str(i)},
+                    timeout=15,
+                )
+
+            # General API call should still work (different bucket)
+            rs = requests.get(
+                f"{base_url}/api/v2/sessions/{sid}/status",
+                headers=auth_headers,
+                timeout=10,
+            )
+            assert rs.status_code == 200, (
+                f"Session status rejected after uploads: {rs.status_code} {rs.text}"
+            )
+        finally:
+            requests.delete(f"{base_url}/api/v2/sessions/{sid}", headers=auth_headers, timeout=5)

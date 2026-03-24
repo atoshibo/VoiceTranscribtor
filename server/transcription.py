@@ -269,11 +269,15 @@ def transcribe_audio(
     # Legacy params (kept for call-site compatibility with old worker code)
     diarization_enabled: bool = False,
     speaker_count: int = 1,
-) -> Tuple[str, List[Dict]]:
+) -> Tuple[str, List[Dict], Dict[str, Any]]:
     """
-    Transcribe audio. Returns (full_text, segments).
+    Transcribe audio. Returns (full_text, segments, detection_info).
 
     Each segment: {"start": float, "end": float, "text": str}
+
+    detection_info: {"detected_language": str|None,
+                     "language_probability": float,
+                     "requested_language": str|None}
 
     segment_callback(last_segments): called every 5 segments with the last 2
     collected so callers can surface a live partial preview without waiting for
@@ -336,7 +340,14 @@ def transcribe_audio(
 
     timestamps = _suppress_repetition_loops(timestamps, _MAX_REPEAT_SEGS)
     full_text = " ".join(s["text"] for s in timestamps)
-    return full_text, timestamps
+
+    detection_info: Dict[str, Any] = {
+        "detected_language": lang,
+        "language_probability": round(prob, 3) if prob else 0.0,
+        "requested_language": language,  # None means auto-detect was used
+    }
+
+    return full_text, timestamps, detection_info
 
 
 # ---------------------------------------------------------------------------

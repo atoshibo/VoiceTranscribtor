@@ -62,10 +62,21 @@ from fastapi.responses import FileResponse
 # ---------------------------------------------------------------------------
 SESSIONS_DIR = Path(os.getenv("SESSIONS_DIR", "/data/sessions"))
 MAX_CHUNK_MB = int(os.getenv("MAX_CHUNK_MB", "30"))
-MAX_SESSION_CHUNKS = int(os.getenv("MAX_SESSION_CHUNKS", "200"))
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+MAX_SESSION_CHUNKS = int(os.getenv("MAX_SESSION_CHUNKS", "500"))
 # How many chunks between partial transcription triggers (0 = disabled)
 PARTIAL_EVERY_N_CHUNKS = int(os.getenv("PARTIAL_EVERY_N_CHUNKS", "5"))
+# Minimum wall-clock seconds between partial transcription triggers for the same session.
+# Prevents the GPU from being overwhelmed by repeated growing-audio partials during
+# backlog catch-up uploads. Default 120s = at most one partial per 2 minutes per session.
+# Set to 0 to disable the cooldown (lockfile-only concurrency guard remains).
+PARTIAL_COOLDOWN_SECONDS = int(os.getenv("PARTIAL_COOLDOWN_SECONDS", "120"))
+
+# Rate limiting — separate buckets for general API calls vs chunk uploads.
+# Upload traffic (many chunks in rapid succession) needs a much higher ceiling
+# than ordinary polling/finalize/transcript-fetch calls.
+RATE_LIMIT_GENERAL_PER_MINUTE = int(os.getenv("RATE_LIMIT_GENERAL_PER_MINUTE",
+                                               os.getenv("RATE_LIMIT_PER_MINUTE", "60")))
+RATE_LIMIT_UPLOAD_PER_MINUTE = int(os.getenv("RATE_LIMIT_UPLOAD_PER_MINUTE", "300"))
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
@@ -76,8 +87,30 @@ AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 # Allowed model sizes — validated at finalize time
 ALLOWED_MODELS = frozenset({"tiny", "base", "small", "medium", "large-v2", "large-v3"})
 
-# In-memory rate limit buckets: token_hash → list of epoch timestamps
+# Default model for full-job transcription when the client does not specify one.
+# Falls back to WHISPER_MODEL env (which the worker also reads), then "small".
+# Partial preview jobs always use "base" for speed regardless of this setting.
+DEFAULT_FULL_MODEL: str = os.getenv(
+    "WHISPER_MODEL_FULL",
+    os.getenv("WHISPER_MODEL", "small"),
+)
+DEFAULT_PARTIAL_MODEL: str = "base"
+
+# In-memory rate limit buckets: bucket_key → list of epoch timestamps
+# General and upload traffic use separate bucket namespaces.
 _rate_buckets: dict = {}
+
+# Startup diagnostic — confirms env vars reached the container
+print(
+    f"[api_v2] config: MAX_CHUNK_MB={MAX_CHUNK_MB} "
+    f"MAX_SESSION_CHUNKS={MAX_SESSION_CHUNKS} "
+    f"PARTIAL_EVERY_N_CHUNKS={PARTIAL_EVERY_N_CHUNKS} "
+    f"PARTIAL_COOLDOWN_SECONDS={PARTIAL_COOLDOWN_SECONDS} "
+    f"RATE_LIMIT_GENERAL={RATE_LIMIT_GENERAL_PER_MINUTE}/min "
+    f"RATE_LIMIT_UPLOAD={RATE_LIMIT_UPLOAD_PER_MINUTE}/min "
+    f"DEFAULT_FULL_MODEL={DEFAULT_FULL_MODEL} "
+    f"DEFAULT_PARTIAL_MODEL={DEFAULT_PARTIAL_MODEL}"
+)
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
 
@@ -99,13 +132,19 @@ def _get_redis():
         return None
 
 
-def _check_rate_limit(token: str) -> bool:
-    """Sliding-window rate limit: max RATE_LIMIT_PER_MINUTE requests/60s per token."""
+def _check_rate_limit(token: str, bucket_prefix: str, limit: int) -> bool:
+    """
+    Sliding-window rate limit: max `limit` requests per 60s per (token, bucket_prefix).
+
+    Different bucket_prefix values create independent counters, so upload
+    traffic does not compete with general API traffic.
+    """
     now = time.monotonic()
-    key = hashlib.sha256(token.encode()).hexdigest()[:16]
+    token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
+    key = f"{bucket_prefix}:{token_hash}"
     bucket = _rate_buckets.setdefault(key, [])
     bucket[:] = [t for t in bucket if now - t < 60.0]
-    if len(bucket) >= RATE_LIMIT_PER_MINUTE:
+    if len(bucket) >= limit:
         return False
     bucket.append(now)
     return True
@@ -122,8 +161,8 @@ def _extract_token(request: Request) -> Optional[str]:
     return None
 
 
-async def require_auth(request: Request) -> str:
-    """FastAPI dependency: validate token and check rate limit."""
+def _validate_token(request: Request) -> str:
+    """Validate auth token. Returns the token string or raises 401/403."""
     token = _extract_token(request)
     if not token:
         raise HTTPException(
@@ -133,11 +172,47 @@ async def require_auth(request: Request) -> str:
         )
     if AUTH_TOKEN and token != AUTH_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token.")
-    if not _check_rate_limit(token):
+    return token
+
+
+async def require_auth(request: Request) -> str:
+    """FastAPI dependency: validate token and check GENERAL rate limit."""
+    token = _validate_token(request)
+    if not _check_rate_limit(token, "general", RATE_LIMIT_GENERAL_PER_MINUTE):
         raise HTTPException(
             status_code=429,
-            detail=f"Rate limit exceeded ({RATE_LIMIT_PER_MINUTE} requests/minute).",
-            headers={"Retry-After": "60"},
+            detail=f"Rate limit exceeded ({RATE_LIMIT_GENERAL_PER_MINUTE} requests/minute).",
+            headers={"Retry-After": "10"},
+        )
+    return token
+
+
+async def require_auth_upload(request: Request) -> str:
+    """
+    FastAPI dependency: validate token and check UPLOAD rate limit.
+
+    Chunk uploads happen in rapid bursts (many chunks per session, multiple
+    sessions concurrently). They use a separate, higher-ceiling bucket so
+    that normal polling/finalize traffic is not starved and uploads are not
+    needlessly throttled.
+    """
+    token = _validate_token(request)
+    if not _check_rate_limit(token, "upload", RATE_LIMIT_UPLOAD_PER_MINUTE):
+        token_hash = hashlib.sha256(token.encode()).hexdigest()[:8]
+        print(
+            f"[RATE-LIMIT] Upload 429 for token_hash={token_hash} "
+            f"(limit={RATE_LIMIT_UPLOAD_PER_MINUTE}/min)"
+        )
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": f"Upload rate limit exceeded ({RATE_LIMIT_UPLOAD_PER_MINUTE} requests/minute).",
+                "reason": "upload_rate_limited",
+                "limit_per_minute": RATE_LIMIT_UPLOAD_PER_MINUTE,
+                "retry_after_seconds": 5,
+                "endpoint_category": "upload",
+            },
+            headers={"Retry-After": "5"},
         )
     return token
 
@@ -196,20 +271,96 @@ def _derive_session_state(session_data: dict, status_data: dict) -> str:
     return "created"
 
 
+def _derive_backend_outcome(state: str, session_dir: Path) -> str:
+    """
+    Derive a stable, unambiguous backend outcome for Android reconciliation.
+
+    This value is the single source of truth for "what happened on the server".
+    Android should use this to override any local integrity heuristic when
+    determining whether to show a session as ready, failed, or in-progress.
+
+    Returns one of:
+        completed       — transcription finished AND transcript file exists
+        completed_empty — transcription finished but no transcript on disk (unusual)
+        failed          — worker reported an error
+        processing      — worker is actively transcribing
+        queued          — waiting for worker pickup
+        not_started     — session exists but has not been finalized yet
+    """
+    if state == "done":
+        has_transcript = (
+            (session_dir / "transcript.txt").exists()
+            or (session_dir / "raw_transcript.json").exists()
+        )
+        return "completed" if has_transcript else "completed_empty"
+    if state == "error":
+        return "failed"
+    if state == "running":
+        return "processing"
+    if state == "queued":
+        return "queued"
+    return "not_started"
+
+
+def _derive_failure_category(error_obj: Optional[dict]) -> Optional[str]:
+    """
+    Classify a worker failure into a stable category Android can act on.
+
+    Returns None for non-error states.  Categories:
+        gpu_error     — CUDA / GPU / driver issue
+        audio_missing — audio.wav not found on disk
+        model_error   — whisper model loading failure
+        internal_error — anything else
+    """
+    if not error_obj:
+        return None
+
+    etype = (error_obj.get("error_type") or "").lower()
+    emsg = (error_obj.get("error_message") or "").lower()
+    combined = f"{etype} {emsg}"
+
+    if "filenotfounderror" in etype and "audio" in emsg:
+        return "audio_missing"
+    if any(kw in combined for kw in ("cuda", "gpu", "nvidia", "cublas", "cudnn", "cuinit")):
+        return "gpu_error"
+    if any(kw in combined for kw in ("model", "loading model", "download")):
+        return "model_error"
+    return "internal_error"
+
+
 def _trigger_partial(session_id: str, session_dir: Path, session_data: dict) -> None:
     """
-    Enqueue a partial transcription job if not already pending.
+    Enqueue a partial transcription job if not already pending and the
+    wall-clock cooldown since the last partial trigger has elapsed.
 
-    Uses a lockfile (partial_pending) to prevent queuing more than one
-    partial job per session at a time. The worker removes the lockfile when done.
+    Guard 1 — lockfile (partial_pending):
+      Prevents queuing more than one partial job per session at a time.
+      The worker removes the lockfile when done.
 
-    Note: if the worker crashes mid-partial, the lockfile may linger and suppress
-    further partial jobs. This is acceptable — the final finalize() transcript will
-    still work correctly.
+    Guard 2 — cooldown (PARTIAL_COOLDOWN_SECONDS):
+      Prevents *sequential* partial re-triggers from consuming excessive
+      GPU time during backlog/catch-up uploads.  The timestamp of the
+      last trigger is stored in v2_session.json["last_partial_trigger_at"].
+
+    If the worker crashes mid-partial the lockfile may linger and suppress
+    further partial jobs. This is acceptable — the final finalize() transcript
+    still works correctly.
     """
     pending_flag = session_dir / "partial_pending"
     if pending_flag.exists():
         return  # already one in flight
+
+    # --- Cooldown guard ---
+    if PARTIAL_COOLDOWN_SECONDS > 0:
+        last_trigger = session_data.get("last_partial_trigger_at")
+        if last_trigger:
+            try:
+                last_ts = datetime.fromisoformat(last_trigger.replace("Z", "+00:00"))
+                elapsed = (datetime.now(timezone.utc) - last_ts).total_seconds()
+                if elapsed < PARTIAL_COOLDOWN_SECONDS:
+                    return  # cooldown not yet elapsed
+            except (ValueError, TypeError):
+                pass  # malformed timestamp — ignore, allow trigger
 
     # Best-effort: read existing metadata for language/model params
     metadata: dict = {}
@@ -234,11 +385,21 @@ def _trigger_partial(session_id: str, session_dir: Path, session_data: dict) -> 
                 "job_type": "v2_partial",
                 "language": metadata.get("language"),
                 "speaker_count": metadata.get("speaker_count", 1),
-                "model_size": metadata.get("model_size", "base"),
+                "model_size": metadata.get("model_size", DEFAULT_PARTIAL_MODEL),
                 "timestamps": True,
             }
             r.rpush(REDIS_PARTIAL_QUEUE, json.dumps(job_data))
-            print(f"[V2] Enqueued partial job for session {session_id}")
+            print(
+                f"[V2] Enqueued partial job for session {session_id} "
+                f"(cooldown={PARTIAL_COOLDOWN_SECONDS}s)"
+            )
+            # Record cooldown timestamp ONLY after successful enqueue.
+            # Failed enqueue or no-Redis must NOT consume the cooldown window.
+            session_data["last_partial_trigger_at"] = _utcnow()
+            try:
+                _write_json(session_dir / "v2_session.json", session_data)
+            except Exception:
+                pass  # best-effort — lock is already claimed, job is enqueued
         except Exception as e:
             print(f"[V2] Warning: failed to enqueue partial job: {e}")
             try:
@@ -256,6 +417,19 @@ def _trigger_partial(session_id: str, session_dir: Path, session_data: dict) -> 
 # ---------------------------------------------------------------------------
 # WAV merging
 # ---------------------------------------------------------------------------
+def _measure_wav_duration(path: Path) -> Optional[float]:
+    """Return duration in seconds of a WAV file, or None on error."""
+    try:
+        with wave.open(str(path), "rb") as w:
+            frames = w.getnframes()
+            rate = w.getframerate()
+            if rate > 0:
+                return round(frames / rate, 2)
+    except Exception:
+        pass
+    return None
+
+
 def _merge_wav_chunks(session_dir: Path, chunk_paths: List[Path]) -> Path:
     """
     Merge ordered WAV chunks into a single audio.wav.
@@ -341,7 +515,7 @@ async def health():
 
     return {
         "ok": True,
-        "version": "2.3.0",
+        "version": "2.4.0",
         "gpu_available": gpu_available,
         "gpu_reason": gpu_reason,
         "selected_device": selected_device,
@@ -471,10 +645,15 @@ async def create_session(request: Request, _token: str = Depends(require_auth)):
         device_id           str
         client_session_id   str
         started_at_utc      ISO datetime str
-        sample_rate_hz      int (default 16000)
+        sample_rate_hz      int (default 16000) — also accepted as "sample_rate"
         channels            int (default 1)
         format              str (default "wav")
         mode                "stream" | "file" (default "stream")
+        source_type         str — Android client sends this; "device_import" maps to
+                            mode="file" (suppresses partial transcription triggers).
+                            Other values (e.g. "ble_stream") map to mode="stream".
+        chunk_duration_sec  float — stored for diagnostics (Android sends this)
+        diarization         bool — stored as session-level hint for finalize default
 
     Session rollover for continuous BLE:
         Finalize the current session, then immediately call this to get a new
@@ -491,15 +670,31 @@ async def create_session(request: Request, _token: str = Depends(require_auth)):
     d.mkdir(parents=True, exist_ok=True)
     (d / "chunks").mkdir(exist_ok=True)
 
+    # --- Field alias resolution ---
+    # sample_rate: accept "sample_rate" as alias for "sample_rate_hz" (Android client)
+    sample_rate_hz = body.get("sample_rate_hz") or body.get("sample_rate") or 16000
+
+    # source_type → mode mapping:
+    #   "device_import" → "file"  (no partial transcription triggers)
+    #   anything else   → keep explicit "mode" if set, else "stream"
+    source_type = body.get("source_type")  # e.g. "ble_stream", "device_import"
+    if source_type == "device_import":
+        mode = "file"
+    else:
+        mode = body.get("mode", "stream")
+
     session_data = {
         "session_id": session_id,
         "client_session_id": body.get("client_session_id"),
         "device_id": body.get("device_id"),
         "started_at_utc": body.get("started_at_utc"),
-        "sample_rate_hz": body.get("sample_rate_hz", 16000),
+        "sample_rate_hz": int(sample_rate_hz),
         "channels": body.get("channels", 1),
         "format": body.get("format", "wav"),
-        "mode": body.get("mode", "stream"),
+        "mode": mode,
+        "source_type": source_type,  # preserve original for diagnostics
+        "chunk_duration_sec": body.get("chunk_duration_sec"),
+        "diarization_hint": bool(body.get("diarization", False)),
         "created_at": _utcnow(),
         "state": "created",
         "chunks": [],
@@ -528,13 +723,19 @@ async def upload_chunk(
     chunk_started_ms: int = Form(0),
     chunk_duration_ms: int = Form(0),
     is_final: bool = Form(False),
-    # --- Continuity metadata (optional, Android-provided audio integrity hints) ---
-    # All default to 0/False for full backward compatibility with existing clients.
+    # --- Continuity metadata (legacy field names) ---
     dropped_frames: int = Form(0),
     decode_failure: bool = Form(False),
     gap_before_ms: int = Form(0),
     source_degraded: bool = Form(False),
-    _token: str = Depends(require_auth),
+    # --- Continuity metadata (current Android field names) ---
+    # These are aliases for the legacy names above.  If both the legacy and
+    # the current name are sent, the current-name value wins (non-zero trumps).
+    decode_errors: int = Form(0),
+    ble_gaps: int = Form(0),
+    plc_frames_applied: int = Form(0),
+    has_continuity_warning: bool = Form(False),
+    _token: str = Depends(require_auth_upload),
 ):
     """
     Upload one WAV chunk for a session.
@@ -546,14 +747,30 @@ async def upload_chunk(
         chunk_duration_ms Duration of this chunk in ms (default 0)
         is_final          true if this is the last chunk (default false)
 
-        Continuity metadata (optional, all default 0/false):
-        dropped_frames    Audio frames dropped during BLE transfer for this chunk
-        decode_failure    Whether this chunk had a decode error
-        gap_before_ms     Reported gap before this chunk (ms)
-        source_degraded   Whether source signal was degraded for this chunk
+        Continuity metadata (all optional, all default 0/false):
+          Legacy names (original server contract):
+            dropped_frames    BLE/audio frames dropped
+            decode_failure    Whether this chunk had a decode error
+            gap_before_ms     Reported gap before this chunk (ms)
+            source_degraded   Whether source signal was degraded
+
+          Current Android names (accepted as aliases):
+            decode_errors          int  — maps to decode_failure (>0 = True)
+            ble_gaps               int  — maps to gap_before_ms
+            plc_frames_applied     int  — added to dropped_frames
+            has_continuity_warning bool — maps to source_degraded
 
     Returns 409 if session is already finalized — ensures no chunk lands in two sessions.
     """
+    # Normalize current-Android continuity fields into legacy stored schema.
+    # Non-zero current-name values take precedence over zero legacy values.
+    if decode_errors > 0 and not decode_failure:
+        decode_failure = True
+    if ble_gaps > 0 and gap_before_ms == 0:
+        gap_before_ms = ble_gaps
+    dropped_frames = dropped_frames + plc_frames_applied
+    if has_continuity_warning and not source_degraded:
+        source_degraded = True
     d = _require_v2_session(session_id)
 
     session_path = d / "v2_session.json"
@@ -568,7 +785,15 @@ async def upload_chunk(
 
     existing_chunks = session_data.get("chunks", [])
     if len(existing_chunks) >= MAX_SESSION_CHUNKS:
-        raise HTTPException(413, f"Too many chunks (max {MAX_SESSION_CHUNKS}).")
+        print(f"[api_v2] 413 too_many_chunks: session={session_id} "
+              f"current={len(existing_chunks)} limit={MAX_SESSION_CHUNKS} "
+              f"chunk_index={chunk_index}")
+        raise HTTPException(413, detail={
+            "reason": "too_many_chunks",
+            "message": f"Too many chunks (max {MAX_SESSION_CHUNKS}).",
+            "limit": MAX_SESSION_CHUNKS,
+            "current": len(existing_chunks),
+        })
 
     # Stream-write chunk with size limit
     max_bytes = MAX_CHUNK_MB * 1024 * 1024
@@ -581,7 +806,15 @@ async def upload_chunk(
             if bytes_written > max_bytes:
                 f.close()
                 chunk_path.unlink(missing_ok=True)
-                raise HTTPException(413, f"Chunk too large (max {MAX_CHUNK_MB} MB).")
+                print(f"[api_v2] 413 chunk_too_large: session={session_id} "
+                      f"chunk_index={chunk_index} bytes={bytes_written} "
+                      f"limit_mb={MAX_CHUNK_MB}")
+                raise HTTPException(413, detail={
+                    "reason": "chunk_too_large",
+                    "message": f"Chunk too large (max {MAX_CHUNK_MB} MB).",
+                    "limit_mb": MAX_CHUNK_MB,
+                    "chunk_bytes": bytes_written,
+                })
             f.write(data)
 
     now = _utcnow()
@@ -593,13 +826,20 @@ async def upload_chunk(
         "chunk_duration_ms": chunk_duration_ms,
         "bytes": bytes_written,
         "uploaded_at": now,
-        # Continuity metadata — stored even if all zeros (allows analysis to
-        # distinguish "no hints sent" vs "hints sent, all clean")
+        # Continuity metadata — normalized into the canonical schema.
+        # Worker _build_continuity_hints reads these exact field names.
         "dropped_frames": dropped_frames,
         "decode_failure": decode_failure,
         "gap_before_ms": gap_before_ms,
         "source_degraded": source_degraded,
     }
+    # Preserve raw Android-origin fields for diagnostics (only if non-zero)
+    if decode_errors:
+        chunk_info["_raw_decode_errors"] = decode_errors
+    if ble_gaps:
+        chunk_info["_raw_ble_gaps"] = ble_gaps
+    if plc_frames_applied:
+        chunk_info["_raw_plc_frames_applied"] = plc_frames_applied
     chunks = [c for c in existing_chunks if c["chunk_index"] != chunk_index]
     chunks.append(chunk_info)
     chunks.sort(key=lambda c: c["chunk_index"])
@@ -619,13 +859,18 @@ async def upload_chunk(
 
     _write_json(session_path, session_data)
 
-    # Trigger partial transcription every N chunks for stream sessions
+    # Trigger partial transcription every N chunks for stream sessions.
+    # Suppressed when:
+    #   - mode != "stream" (e.g. device_import file uploads)
+    #   - is_final is set (finalize imminent — partial would be wasted GPU work)
+    #   - cooldown not yet elapsed (see _trigger_partial)
     total_chunks = len(chunks)
     if (
-        session_data.get("mode", "stream") == "stream"
+        not is_final
+        and session_data.get("mode", "stream") == "stream"
         and PARTIAL_EVERY_N_CHUNKS > 0
         and total_chunks % PARTIAL_EVERY_N_CHUNKS == 0
-        and session_data.get("state") in ("receiving", "chunks_complete", "partially_processed")
+        and session_data.get("state") in ("receiving", "partially_processed")
     ):
         try:
             _trigger_partial(session_id, d, session_data)
@@ -678,12 +923,51 @@ async def finalize_session(
 
     state = session_data.get("state")
     if state == "finalized":
-        # Idempotent: return existing job info
+        # Idempotent: return existing job info.
+        # But first check if the job is stuck (never picked up by worker).
+        # If status is still "uploaded" and Redis is available, silently re-enqueue.
+        status_path = d / "status.json"
+        stuck_requeued = False
+        if status_path.exists():
+            try:
+                cur_status = _read_json(status_path)
+                cur_internal = cur_status.get("status", "")
+                if cur_internal in ("uploaded", "pending", "created"):
+                    # Job was never picked up — try to re-enqueue
+                    r = _get_redis()
+                    if r:
+                        meta_path = d / "metadata.json"
+                        meta = _read_json(meta_path) if meta_path.exists() else {}
+                        retry_job = {
+                            "session_id": session_id,
+                            "language": meta.get("language"),
+                            "speaker_count": meta.get("speaker_count", 1),
+                            "diarization_enabled": meta.get("diarization_enabled", False),
+                            "model_size": meta.get("model_size", DEFAULT_FULL_MODEL),
+                            "timestamps": True,
+                            "job_type": "v2",
+                            "queued_at": _utcnow(),
+                            "retry": True,
+                        }
+                        si = session_data.get("session_integrity")
+                        if si:
+                            retry_job["session_integrity"] = si
+                        r.rpush(REDIS_QUEUE, json.dumps(retry_job))
+                        stuck_requeued = True
+                        print(
+                            f"[V2-FINALIZE] Re-enqueued stuck job for session {session_id} "
+                            f"(status was '{cur_internal}')"
+                        )
+            except Exception as e:
+                print(f"[V2-FINALIZE] Stuck-job re-enqueue check failed: {e}")
+
+        msg = "Already finalized — re-enqueued (was stuck)." if stuck_requeued else "Already finalized."
         return {
             "session_id": session_id,
             "job_id": session_id,
             "status_url": f"/api/v2/jobs/{session_id}",
-            "message": "Already finalized.",
+            "message": msg,
+            "requeued": stuck_requeued,
         }
     if state == "cancelled":
         raise HTTPException(409, "Session was cancelled.")
@@ -692,15 +976,40 @@ async def finalize_session(
     if not chunks:
         raise HTTPException(400, "No chunks uploaded. Upload at least one chunk before finalizing.")
 
-    # Gather chunk files in order
+    # Gather chunk files in order — with merge diagnostics
+    registered_indices = sorted(c["chunk_index"] for c in chunks)
     chunk_paths: List[Path] = []
+    missing_indices: List[int] = []
+    total_chunk_bytes = 0
     for ci in sorted(chunks, key=lambda c: c["chunk_index"]):
         p = d / "chunks" / f"chunk_{ci['chunk_index']:04d}.wav"
         if p.exists():
             chunk_paths.append(p)
+            try:
+                total_chunk_bytes += p.stat().st_size
+            except Exception:
+                pass
+        else:
+            missing_indices.append(ci["chunk_index"])
+
+    if missing_indices:
+        print(
+            f"[V2-MERGE] WARNING session={session_id}: "
+            f"{len(missing_indices)} chunk(s) missing on disk — "
+            f"indices={missing_indices} "
+            f"registered={len(chunks)} found={len(chunk_paths)}"
+        )
 
     if not chunk_paths:
         raise HTTPException(400, "Chunk files missing on disk. Re-upload chunks.")
+
+    print(
+        f"[V2-MERGE] session={session_id}: "
+        f"registered={len(chunks)} found={len(chunk_paths)} "
+        f"indices=[{registered_indices[0]}..{registered_indices[-1]}] "
+        f"missing={len(missing_indices)} "
+        f"total_chunk_bytes={total_chunk_bytes}"
+    )
 
     # Merge into audio.wav
     try:
@@ -708,10 +1017,32 @@ async def finalize_session(
     except Exception as e:
         raise HTTPException(500, f"Failed to merge audio chunks: {e}")
 
+    # Measure merged audio duration for truthful metadata
+    merged_path = d / "audio.wav"
+    audio_duration_s = _measure_wav_duration(merged_path)
+    merged_bytes = 0
+    try:
+        merged_bytes = merged_path.stat().st_size
+    except Exception:
+        pass
+    print(
+        f"[V2-MERGE] session={session_id}: merged audio.wav "
+        f"bytes={merged_bytes} duration_s={audio_duration_s}"
+    )
+
     # Build transcription options
     # Accept num_speakers as alias for speaker_count (Android client field drift compat)
+    # Accept "diarization" as legacy alias for "run_diarization" (older Android clients)
     language_raw: str = body.get("language", "auto")
-    run_diarization: bool = bool(body.get("run_diarization", False))
+    run_diarization: bool = bool(
+        body.get("run_diarization")
+        or body.get("diarization")
+        or False
+    )
+    _diarization_field_used = (
+        "run_diarization" if "run_diarization" in body
+        else ("diarization" if "diarization" in body else "default(false)")
+    )
 
     model_size_raw = body.get("model_size") or None
     if model_size_raw is not None and model_size_raw not in ALLOWED_MODELS:
@@ -720,12 +1051,32 @@ async def finalize_session(
             f"Invalid model_size '{model_size_raw}'. "
             f"Allowed: {', '.join(sorted(ALLOWED_MODELS))}",
         )
-    model_size: str = model_size_raw or "base"
+    model_size: str = model_size_raw or DEFAULT_FULL_MODEL
 
+    _speaker_count_field_used = (
+        "speaker_count" if "speaker_count" in body
+        else ("num_speakers" if "num_speakers" in body else "default")
+    )
     speaker_count: int = int(
         body.get("speaker_count")
         or body.get("num_speakers")
         or (2 if run_diarization else 1)
+    )
+
+    # Safety: if diarization is requested but speaker_count ended up < 2
+    # (e.g., client sent speaker_count=1 with diarization=true), force to 2.
+    if run_diarization and speaker_count < 2:
+        print(
+            f"[V2-FINALIZE] session={session_id}: diarization enabled but "
+            f"speaker_count={speaker_count} (from {_speaker_count_field_used}) "
+            f"— forcing speaker_count=2"
+        )
+        speaker_count = 2
+
+    print(
+        f"[V2-FINALIZE] session={session_id}: diarization={run_diarization} "
+        f"(field={_diarization_field_used}) speaker_count={speaker_count} "
+        f"(field={_speaker_count_field_used})"
     )
 
     # "auto" → pass None to faster-whisper for language auto-detection (never coerce to "en")
@@ -744,6 +1095,13 @@ async def finalize_session(
         "model_size": model_size,
         "timestamps": True,
         "diarization_enabled": run_diarization,
+        "audio_duration_s": audio_duration_s,
+        "merge_info": {
+            "registered_chunks": len(chunks),
+            "merged_chunks": len(chunk_paths),
+            "missing_chunks": len(missing_indices),
+            "merged_bytes": merged_bytes,
+        },
         "created_at": session_data.get("created_at"),
         "v2": True,
     }
@@ -775,6 +1133,7 @@ async def finalize_session(
         "session_id": session_id,
         "language": language_for_worker,
         "speaker_count": speaker_count,
+        "diarization_enabled": run_diarization,
         "model_size": model_size,
         "timestamps": True,
         "job_type": "v2",
@@ -783,20 +1142,32 @@ async def finalize_session(
     if session_integrity:
         job_data["session_integrity"] = session_integrity
 
+    enqueued = False
     r = _get_redis()
     if r:
         try:
             r.rpush(REDIS_QUEUE, json.dumps(job_data))
-            print(f"[V2] Enqueued job for session {session_id}")
+            enqueued = True
+            print(
+                f"[V2-FINALIZE] Accepted session={session_id} "
+                f"chunks={len(chunks)} model={model_size} "
+                f"speakers={speaker_count} lang={language_for_worker or 'auto'} "
+                f"diarization={run_diarization} (field={_diarization_field_used}) "
+                f"integrity={'yes' if session_integrity else 'no'}"
+            )
         except Exception as e:
-            print(f"[V2] Warning: failed to enqueue job: {e}")
+            print(f"[V2-FINALIZE] ENQUEUE FAILED session={session_id}: {e}")
     else:
-        print(f"[V2] Warning: Redis unavailable, job {session_id} not enqueued")
+        print(
+            f"[V2-FINALIZE] REDIS UNAVAILABLE session={session_id} — "
+            "job NOT enqueued. Client should retry finalize."
+        )
 
     return {
         "session_id": session_id,
         "job_id": session_id,
         "status_url": f"/api/v2/jobs/{session_id}",
+        "enqueued": enqueued,
     }
 
 
@@ -806,6 +1177,15 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
     Poll transcription job status.
 
     States: queued | running | done | error
+
+    Reconciliation fields (new, backward-compatible):
+        backend_outcome     — stable truth: "completed" | "completed_empty" | "failed" |
+                              "processing" | "queued". Android SHOULD prefer this over
+                              local integrity heuristics when deciding what to show the user.
+        transcript_present  — true iff a transcript file exists on disk
+        failure_category    — null unless failed: "gpu_error" | "audio_missing" |
+                              "model_error" | "internal_error"
+        partial_transcript_available — true iff a partial transcript was generated
 
     progress: {upload: 0-100, processing: 0-100, stage: str}
     partial_preview: last 1-2 transcribed sentences while running, null otherwise
@@ -864,6 +1244,10 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
             meta["language_requested"] = md.get("language")  # None = auto
             meta["model_size"] = md.get("model_size")
             meta["speaker_count"] = md.get("speaker_count")
+            meta["diarization_enabled"] = md.get("diarization_enabled", False)
+            # Audio duration measured at merge time (truthful, not transcript-derived)
+            if md.get("audio_duration_s") is not None:
+                meta["audio_duration_s"] = md["audio_duration_s"]
         except Exception:
             pass
 
@@ -874,6 +1258,7 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
                 segs = json.loads(tsp.read_text(encoding="utf-8"))
                 meta["segment_count"] = len(segs)
                 if segs:
+                    # Backward compat: duration_s = last segment end (transcript coverage)
                     meta["duration_s"] = round(segs[-1].get("end", 0), 1)
             except Exception:
                 pass
@@ -885,6 +1270,38 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
                 meta["word_count"] = a.get("word_count")
             except Exception:
                 pass
+        # Coverage metadata from worker (truthful audio vs transcript comparison)
+        cov_path = session_dir / "coverage_meta.json"
+        if cov_path.exists():
+            try:
+                cov = _read_json(cov_path)
+                # audio_duration_s: actual WAV file duration (ground truth)
+                meta.setdefault("audio_duration_s", cov.get("audio_duration_s"))
+                # transcript_last_end_s: where the transcript actually ends
+                meta["transcript_last_end_s"] = cov.get("transcript_last_end_s")
+                # coverage_ratio: transcript_end / audio_duration (1.0 = full coverage)
+                meta["transcript_coverage_ratio"] = cov.get("transcript_coverage_ratio")
+                # Warning flag if coverage is suspiciously low
+                if cov.get("coverage_warning"):
+                    meta["coverage_warning"] = cov["coverage_warning"]
+            except Exception:
+                pass
+        # Fallback: measure audio.wav directly if no coverage_meta.json yet
+        if "audio_duration_s" not in meta or meta["audio_duration_s"] is None:
+            audio_path = session_dir / "audio.wav"
+            if audio_path.exists():
+                dur = _measure_wav_duration(audio_path)
+                if dur is not None:
+                    meta["audio_duration_s"] = dur
+        # Classification summary (if available)
+        clf_path = session_dir / "classification.json"
+        if clf_path.exists():
+            try:
+                clf = _read_json(clf_path)
+                meta["classification"] = clf.get("category")
+                meta["classification_confidence"] = clf.get("confidence")
+            except Exception:
+                pass
 
     # Live partial preview: populated by worker's segment_callback every 5 segments.
     # Only returned while running; null in all other states.
@@ -892,9 +1309,23 @@ async def get_job_status(job_id: str, _token: str = Depends(require_auth)):
     if state == "running":
         partial_preview = status_data.get("partial_preview") or None
 
+    # ----- Reconciliation fields (Android truth source) -----
+    backend_outcome = _derive_backend_outcome(state, session_dir)
+    transcript_present = (
+        (session_dir / "transcript.txt").exists()
+        or (session_dir / "raw_transcript.json").exists()
+    )
+    failure_category = _derive_failure_category(error_obj) if state == "error" else None
+    partial_transcript_available = (session_dir / "partial_transcript.json").exists()
+
     response = {
         "job_id": job_id,
         "state": state,
+        # Reconciliation: Android should use these to override local integrity guesses
+        "backend_outcome": backend_outcome,
+        "transcript_present": transcript_present,
+        "failure_category": failure_category,
+        "partial_transcript_available": partial_transcript_available,
         "progress": progress_data,
         "message": message,
         "partial_preview": partial_preview,
@@ -943,10 +1374,18 @@ async def get_session_status(session_id: str, _token: str = Depends(require_auth
     Rich session status — covers the full state machine including pre-finalization states
     (created / receiving / partially_processed) not visible in /jobs/{id}.
 
+    Reconciliation fields (new, backward-compatible):
+        backend_outcome     — stable truth: "completed" | "completed_empty" | "failed" |
+                              "processing" | "queued" | "not_started".
+                              Android SHOULD prefer this over local integrity guesses.
+        transcript_present  — true iff a transcript file exists on disk
+        error_message       — human-readable error description (null unless failed)
+
     Designed to drive native Android UX:
       - Poll every 5-10s during a live recording to show chunk count + partial preview
       - Transition to polling /jobs/{id} after finalize for worker progress
       - Check finished_at to decide when to fetch final /transcript
+      - Use backend_outcome to decide card color / status label
     """
     d = _require_v2_session(session_id)
 
@@ -998,9 +1437,35 @@ async def get_session_status(session_id: str, _token: str = Depends(require_auth
         if live:
             partial_preview = live
 
+    # ----- Reconciliation fields -----
+    backend_outcome = _derive_backend_outcome(state, d)
+    transcript_present = (
+        (d / "transcript.txt").exists()
+        or (d / "raw_transcript.json").exists()
+    )
+
+    # Error message — extract from status.json or error.json
+    error_message: Optional[str] = None
+    if state == "error":
+        error_message = status_data.get("error")
+        if not error_message:
+            error_path = d / "error.json"
+            if error_path.exists():
+                try:
+                    ej = _read_json(error_path)
+                    error_message = ej.get("error_message")
+                except Exception:
+                    pass
+        if not error_message:
+            error_message = "Job failed"
+
     return {
         "session_id": session_id,
         "state": state,
+        # Reconciliation: Android should use these to override local integrity guesses
+        "backend_outcome": backend_outcome,
+        "transcript_present": transcript_present,
+        "error_message": error_message,
         # Upload progress
         "chunk_count": len(chunks),
         "chunks_received": len(chunks),       # alias for Android compat
@@ -1090,6 +1555,7 @@ async def get_transcript(session_id: str, _token: str = Depends(require_auth)):
     words         — word-level timestamps (if available)
     quality_report — structured corruption analysis (null until worker writes it)
     source_integrity — upstream audio damage summary from Android hints (null if no hints)
+    classification — LLM-based transcript category (null if not configured or not run)
 
     Clients that only use text/segments are completely unaffected.
     """
@@ -1261,6 +1727,17 @@ async def get_transcript(session_id: str, _token: str = Depends(require_auth)):
         except Exception:
             pass
 
+    # -----------------------------------------------------------------------
+    # Classification — LLM-based transcript category (optional, null if not run)
+    # -----------------------------------------------------------------------
+    classification: Optional[dict] = None
+    clf_path = d / "classification.json"
+    if clf_path.exists():
+        try:
+            classification = _read_json(clf_path)
+        except Exception:
+            pass
+
     return {
         "session_id": session_id,
         # Backward-compatible canonical field — never loses recognized content
@@ -1283,6 +1760,8 @@ async def get_transcript(session_id: str, _token: str = Depends(require_auth)):
         "quality_report": quality_report,
         # Upstream audio damage summary (null if no Android continuity hints were provided)
         "source_integrity": source_integrity,
+        # LLM-based transcript classification (null if not configured or not yet run)
+        "classification": classification,
     }
 
 
@@ -1302,6 +1781,102 @@ async def get_vtt(session_id: str, _token: str = Depends(require_auth)):
     if not p.exists():
         raise HTTPException(404, "VTT subtitle not available (session not done yet?).")
     return FileResponse(str(p), media_type="text/vtt", filename=f"{session_id}.vtt")
+
+
+@router.post("/sessions/{session_id}/retry")
+async def retry_session(session_id: str, _token: str = Depends(require_auth)):
+    """
+    Re-enqueue a finalized session whose job failed or was never picked up.
+
+    Allowed only when the session is finalized AND the job status is one of:
+      error, uploaded, pending, created (i.e. failed or stuck).
+
+    Running or already-done jobs cannot be retried (returns 409).
+    Resets status.json to "uploaded" and pushes a new job to Redis.
+
+    Idempotent with respect to the audio: no re-merge needed (audio.wav already exists).
+    """
+    d = _require_v2_session(session_id)
+    session_data = _read_json(d / "v2_session.json")
+
+    if session_data.get("state") != "finalized":
+        raise HTTPException(
+            409,
+            "Session is not finalized. Finalize first, then retry if it fails.",
+        )
+
+    status_path = d / "status.json"
+    if not status_path.exists():
+        raise HTTPException(500, "Missing status.json for finalized session.")
+
+    cur_status = _read_json(status_path)
+    cur_internal = cur_status.get("status", "")
+
+    # Only allow retry for non-terminal-success, non-running states
+    if cur_internal == "done":
+        raise HTTPException(409, "Job already completed successfully. Nothing to retry.")
+    if cur_internal in ("processing", "running"):
+        raise HTTPException(409, "Job is currently running. Wait for it to finish.")
+
+    # Verify audio.wav exists (should exist from original finalize merge)
+    if not (d / "audio.wav").exists():
+        raise HTTPException(
+            500,
+            "audio.wav missing — cannot retry. Re-upload chunks and finalize again.",
+        )
+
+    now = _utcnow()
+
+    # Reset status to uploaded/queued
+    _write_json(status_path, {
+        "status": "uploaded",
+        "session_id": session_id,
+        "queued_at": now,
+        "progress": {"upload": 100, "processing": 0, "stage": "queued"},
+        "retry_at": now,
+        "previous_status": cur_internal,
+    })
+
+    # Read metadata for job params
+    meta_path = d / "metadata.json"
+    meta = _read_json(meta_path) if meta_path.exists() else {}
+
+    job_data = {
+        "session_id": session_id,
+        "language": meta.get("language"),
+        "speaker_count": meta.get("speaker_count", 1),
+        "diarization_enabled": meta.get("diarization_enabled", False),
+        "model_size": meta.get("model_size", DEFAULT_FULL_MODEL),
+        "timestamps": True,
+        "job_type": "v2",
+        "queued_at": now,
+        "retry": True,
+    }
+    si = session_data.get("session_integrity")
+    if si:
+        job_data["session_integrity"] = si
+
+    r = _get_redis()
+    if not r:
+        raise HTTPException(503, "Redis unavailable. Retry later.")
+
+    try:
+        r.rpush(REDIS_QUEUE, json.dumps(job_data))
+    except Exception as e:
+        raise HTTPException(503, f"Failed to enqueue retry job: {e}")
+
+    print(
+        f"[V2-RETRY] Re-enqueued session {session_id} "
+        f"(previous_status={cur_internal})"
+    )
+
+    return {
+        "session_id": session_id,
+        "job_id": session_id,
+        "status_url": f"/api/v2/jobs/{session_id}",
+        "message": "Job re-enqueued for retry.",
+        "previous_status": cur_internal,
+    }
 
 
 @router.delete("/sessions/{session_id}")
